@@ -18,8 +18,8 @@ import (
 
 	json "github.com/goccy/go-json"
 
-	"github.com/wwnbb/bybit_api/bpool"
 	pp "github.com/wwnbb/pprint"
+	"github.com/wwnbb/wsmanager/bpool"
 	"github.com/wwnbb/wsmanager/states"
 )
 
@@ -27,9 +27,6 @@ const (
 	wsPingInterval = 10 * time.Second
 )
 
-// WSConnection represents a websocket connection,
-// it embeds the gorilla websocket connection
-// creation done in connect method of WSManager
 type WSConnection struct {
 	*websocket.Conn
 
@@ -74,7 +71,6 @@ type WsMsg struct {
 	Data  interface{}
 }
 
-// WSManager manages the websocket connection
 type WSManager struct {
 	Logger *slog.Logger
 
@@ -120,7 +116,6 @@ func changeState(from, to states.ConnectionState, m *WSManager) bool {
 	return atomic.CompareAndSwapInt32((*int32)(&m.connState), int32(from), int32(to))
 }
 
-// Transition from New to Connecting
 func (m *WSManager) SetConnecting() bool {
 	m.Logger.Debug("SetConnecting", "from", m.GetConnState(), "to", states.StateConnecting)
 	return changeState(m.GetConnState(), states.StateConnecting, m)
