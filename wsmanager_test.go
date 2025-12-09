@@ -662,10 +662,6 @@ func TestCloseMultipleTimes(t *testing.T) {
 
 // Integration test with real server (kept from original)
 func TestCreateWsManager(t *testing.T) {
-	if testing.Short() {
-		t.Skip("Skipping integration test in short mode")
-	}
-
 	url := "wss://stream.bybit.com/v5/public/spot"
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
@@ -719,5 +715,53 @@ func TestCreateWsManager(t *testing.T) {
 	}
 
 	time.Sleep(2 * time.Second)
+	wsm.Close()
+}
+
+func TestConnectDisconnect(t *testing.T) {
+	url := "wss://stream.bybit.com/v5/public/spot"
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	ctx := context.Background()
+
+	wsm := wsmanager.NewWSManager(url, ctx)
+	wsm.SetLogger(logger)
+	err := wsm.Connect()
+	if err != nil {
+		t.Fatalf("Connect failed: %v", err)
+	}
+
+	go func() {
+		for {
+			select {
+			case <-wsm.DataCh:
+			}
+		}
+	}()
+
+	subscribeMsg := map[string]interface{}{
+		"req_id": "test",
+		"op":     "subscribe",
+		"args":   []string{"orderbook.1.BTCUSDT"},
+	}
+	err = wsm.SendRequest(subscribeMsg)
+	if err != nil {
+		t.Fatalf("SendRequest failed: %v", err)
+	}
+
+	time.Sleep(1 * time.Second)
+	wsm.Close()
+	time.Sleep(1 * time.Second)
+	err = wsm.Connect()
+	if err != nil {
+		t.Fatalf("Reconnect failed: %v", err)
+	}
+	time.Sleep(1 * time.Second)
+	err = wsm.SendRequest(subscribeMsg)
+	if err != nil {
+		t.Fatalf("SendRequest after reconnect failed: %v", err)
+	}
+
+	time.Sleep(1 * time.Second)
 	wsm.Close()
 }

@@ -154,7 +154,10 @@ func (m *WSManager) getReqId(topic string) string {
 }
 
 func (m *WSManager) notifyDisconnect() {
-	m.DisconnectSig <- struct{}{}
+	select {
+	case m.DisconnectSig <- struct{}{}:
+	default:
+	}
 }
 
 func NewWSManager(url string, parentCtx context.Context) *WSManager {
@@ -285,9 +288,9 @@ func (m *WSManager) Connect() error {
 
 func (m *WSManager) pingLoop() {
 	m.Logger.Debug("Starting pingLoop")
+	defer m.Logger.Debug("Exiting pingLoop")
 
 	ticker := time.NewTicker(wsPingInterval)
-
 	defer ticker.Stop()
 
 	for {
@@ -295,25 +298,32 @@ func (m *WSManager) pingLoop() {
 		select {
 
 		case <-m.ctx.Done():
-			m.Logger.Debug("Ping loop context done, exiting")
+			m.Logger.Debug("pingLoop context done, exiting")
 			return
 		case <-ticker.C:
+
 			payload := map[string]interface{}{
 				"req_id": m.getReqId("ping"),
 				"op":     "ping",
 			}
 
 			pingBeingSent := false
+			it := time.NewTicker(5 * time.Second)
 			for range 5 {
-				err := conn.WriteJSON(payload)
-				if err != nil {
-					m.Logger.Error("failed to send ping message", "error", err)
-				} else {
-					m.Logger.Debug("Ping message sent")
-					pingBeingSent = true
-					break
+				select {
+				case <-m.ctx.Done():
+					m.Logger.Debug("pingLoop context done, exiting")
+					return
+				case <-it.C:
+					err := conn.WriteJSON(payload)
+					if err != nil {
+						m.Logger.Error("failed to send ping message", "error", err)
+					} else {
+						m.Logger.Debug("Ping message sent")
+						pingBeingSent = true
+						break
+					}
 				}
-				time.Sleep(5 * time.Second)
 			}
 			if !pingBeingSent {
 				m.Logger.Error("failed to send ping message after retries, setting disconnected")
@@ -433,8 +443,6 @@ func (m *WSManager) Close() error {
 
 func (m *WSManager) SendRequest(v interface{}) error {
 	conn := m.getConn()
-
-	// Double-check pattern
 	if state := m.GetConnState(); state != states.StateConnected {
 		return fmt.Errorf("websocket not connected, current state: %s", state.String())
 	}
@@ -443,7 +451,6 @@ func (m *WSManager) SendRequest(v interface{}) error {
 		return fmt.Errorf("websocket connection is nil")
 	}
 
-	// WriteJSON already has lock protection, so this is safe
 	err := conn.WriteJSON(v)
 	if err != nil {
 		m.Logger.Error("failed to send message", "error", err)
