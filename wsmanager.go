@@ -82,13 +82,11 @@ type WSManager struct {
 	Conn      *WSConnection
 	url       string
 
-	DataCh chan any
+	DataCh        chan any
+	DisconnectSig chan struct{}
 
 	requestIds lockfree.HashMap
-
-	reconnectOnce sync.Once
-
-	connMu sync.RWMutex
+	connMu     sync.RWMutex
 }
 
 func (m *WSManager) getConn() *WSConnection {
@@ -128,11 +126,13 @@ func (m *WSManager) SetConnected() bool {
 
 func (m *WSManager) SetDisconnectedFromConnected() bool {
 	m.Logger.Debug("SetConnected", "from", m.GetConnState(), "to", states.StateConnected)
+	defer func() { m.DisconnectSig <- struct{}{} }()
 	return changeState(states.StateConnected, states.StateDisconnected, m)
 }
 
 func (m *WSManager) SetDisconnectedFromConnecting() bool {
 	m.Logger.Debug("SetConnected", "from", m.GetConnState(), "to", states.StateConnected)
+	defer func() { m.DisconnectSig <- struct{}{} }()
 	return changeState(states.StateConnecting, states.StateDisconnected, m)
 }
 
@@ -163,7 +163,8 @@ func NewWSManager(url string, parentCtx context.Context) *WSManager {
 		Logger:     slog.Default(),
 		ctxCancel:  cancel,
 
-		DataCh: make(chan any, 100),
+		DataCh:        make(chan any, 100),
+		DisconnectSig: make(chan struct{}, 1),
 	}
 	return wsm
 }
