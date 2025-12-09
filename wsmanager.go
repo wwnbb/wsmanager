@@ -84,6 +84,7 @@ type WSManager struct {
 
 	DataCh        chan any
 	DisconnectSig chan struct{}
+	disconnectWg  sync.WaitGroup
 
 	requestIds lockfree.HashMap
 	connMu     sync.RWMutex
@@ -178,6 +179,7 @@ func (m *WSManager) SetLogger(Logger *slog.Logger) {
 }
 
 func (m *WSManager) refreshContext() error {
+	m.disconnectWg.Wait()
 	select {
 	case <-m.parentCtx.Done():
 		return fmt.Errorf("parent context done: %w", m.parentCtx.Err())
@@ -267,8 +269,16 @@ func (m *WSManager) Connect() error {
 
 	m.SetConnected()
 
-	go m.readMessages()
-	go m.pingLoop()
+	m.disconnectWg.Add(1)
+	go func() {
+		defer m.disconnectWg.Done()
+		m.readMessages()
+	}()
+	m.disconnectWg.Add(1)
+	go func() {
+		defer m.disconnectWg.Done()
+		m.pingLoop()
+	}()
 
 	return nil
 }
