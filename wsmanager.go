@@ -127,12 +127,14 @@ func (m *WSManager) SetConnected() bool {
 func (m *WSManager) SetDisconnectedFromConnected() bool {
 	m.Logger.Debug("SetConnected", "from", m.GetConnState(), "to", states.StateConnected)
 	defer func() { m.DisconnectSig <- struct{}{} }()
+	fmt.Println("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
 	return changeState(states.StateConnected, states.StateDisconnected, m)
 }
 
 func (m *WSManager) SetDisconnectedFromConnecting() bool {
 	m.Logger.Debug("SetConnected", "from", m.GetConnState(), "to", states.StateConnected)
 	defer func() { m.DisconnectSig <- struct{}{} }()
+	fmt.Println("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
 	return changeState(states.StateConnecting, states.StateDisconnected, m)
 }
 
@@ -288,19 +290,24 @@ func (m *WSManager) pingLoop() {
 				"req_id": m.getReqId("ping"),
 				"op":     "ping",
 			}
-			for range 4 {
+
+			pingBeingSent := false
+			for range 5 {
 				err := conn.WriteJSON(payload)
 				if err != nil {
 					m.Logger.Error("failed to send ping message", "error", err)
-					m.Close()
 				} else {
 					m.Logger.Debug("Ping message sent")
+					pingBeingSent = true
 					break
 				}
 				time.Sleep(5 * time.Second)
 			}
-			m.SetDisconnectedFromConnected()
-			return
+			if !pingBeingSent {
+				m.Logger.Error("failed to send ping message after retries, setting disconnected")
+				m.SetDisconnectedFromConnected()
+				return
+			}
 		}
 	}
 }
@@ -395,6 +402,7 @@ func (m *WSManager) readMessages() {
 }
 
 func (m *WSManager) Close() error {
+	fmt.Println("Closing WSManager")
 	m.SetDisconnectedFromConnected()
 
 	m.ctxCancel()
@@ -415,8 +423,8 @@ func (m *WSManager) SendRequest(v interface{}) error {
 	conn := m.getConn()
 
 	// Double-check pattern
-	if m.GetConnState() != states.StateConnected {
-		return fmt.Errorf("websocket not connected")
+	if state := m.GetConnState(); state != states.StateConnected {
+		return fmt.Errorf("websocket not connected, current state: %s", state.String())
 	}
 
 	if conn == nil {
@@ -427,7 +435,6 @@ func (m *WSManager) SendRequest(v interface{}) error {
 	err := conn.WriteJSON(v)
 	if err != nil {
 		m.Logger.Error("failed to send message", "error", err)
-		// Attempt to transition to disconnected
 		m.SetDisconnectedFromConnected()
 		return fmt.Errorf("failed to send message: %w", err)
 	}
