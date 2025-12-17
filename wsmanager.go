@@ -88,6 +88,7 @@ type WSManager struct {
 
 	requestIds lockfree.HashMap
 	connMu     sync.RWMutex
+	PingFunc   func() map[string]interface{}
 }
 
 func (m *WSManager) getConn() *WSConnection {
@@ -100,6 +101,10 @@ func (m *WSManager) setConn(conn *WSConnection) {
 	m.connMu.Lock()
 	defer m.connMu.Unlock()
 	m.Conn = conn
+}
+
+func SetPingPayloadFunc(m *WSManager, pingFunc func() map[string]interface{}) {
+	m.PingFunc = pingFunc
 }
 
 /*
@@ -294,18 +299,12 @@ func (m *WSManager) pingLoop() {
 	defer ticker.Stop()
 
 	for {
-		conn := m.getConn()
 		select {
 
 		case <-m.ctx.Done():
 			m.Logger.Debug("pingLoop context done, exiting")
 			return
 		case <-ticker.C:
-
-			payload := map[string]interface{}{
-				"req_id": m.getReqId("ping"),
-				"op":     "ping",
-			}
 
 			pingBeingSent := false
 			it := time.NewTicker(5 * time.Second)
@@ -315,7 +314,16 @@ func (m *WSManager) pingLoop() {
 					m.Logger.Debug("pingLoop context done, exiting")
 					return
 				case <-it.C:
-					err := conn.WriteJSON(payload)
+					var payload map[string]interface{}
+					if m.PingFunc == nil {
+						payload = map[string]interface{}{
+							"req_id": m.getReqId("ping"),
+							"op":     "ping",
+						}
+					} else {
+						payload = m.PingFunc()
+					}
+					err := m.SendRequest(payload)
 					if err != nil {
 						m.Logger.Error("failed to send ping message", "error", err)
 					} else {
