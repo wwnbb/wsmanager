@@ -103,7 +103,7 @@ func (m *WSManager) setConn(conn *WSConnection) {
 	m.Conn = conn
 }
 
-func SetPingPayloadFunc(m *WSManager, pingFunc func() map[string]interface{}) {
+func (m *WSManager) SetPingPayloadFunc(pingFunc func() map[string]interface{}) {
 	m.PingFunc = pingFunc
 }
 
