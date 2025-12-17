@@ -147,7 +147,7 @@ func (m *WSManager) SetConnectingFromDisconnected() bool {
 	return changeState(states.StateDisconnected, states.StateConnecting, m)
 }
 
-func (m *WSManager) getReqId(topic string) string {
+func (m *WSManager) GetReqId(topic string) string {
 	if n, exist := m.requestIds.Get(topic); exist {
 		id := n.(int) + 1
 		m.requestIds.Set(topic, id)
