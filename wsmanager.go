@@ -23,10 +23,6 @@ import (
 	"github.com/wwnbb/wsmanager/states"
 )
 
-const (
-	wsPingInterval = 10 * time.Second
-)
-
 type WSConnection struct {
 	*websocket.Conn
 
@@ -51,10 +47,6 @@ func (c *WSConnection) setLastPing(t time.Time) {
 	c.lastPing = t
 }
 
-func (c *WSManager) GetConnState() states.ConnectionState {
-	return states.ConnectionState(atomic.LoadInt32((*int32)(&c.connState)))
-}
-
 func (c *WSConnection) WriteJSON(v any) error {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
@@ -63,6 +55,16 @@ func (c *WSConnection) WriteJSON(v any) error {
 	defer cancel()
 
 	return wsjson.Write(ctx, c.Conn, v)
+}
+
+func (c *WSConnection) WritePing(ctx context.Context) error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	return c.Conn.Ping(ctx)
+}
+
+func (c *WSManager) GetConnState() states.ConnectionState {
+	return states.ConnectionState(atomic.LoadInt32((*int32)(&c.connState)))
 }
 
 type WsMsg struct {
@@ -88,7 +90,11 @@ type WSManager struct {
 
 	requestIds lockfree.HashMap
 	connMu     sync.RWMutex
-	PingFunc   func() map[string]interface{}
+
+	// Pinger handles the ping logic
+	Pinger Pinger
+	// Deprecated: Use Pinger instead
+	PingFunc func() map[string]interface{}
 }
 
 func (m *WSManager) getConn() *WSConnection {
@@ -103,8 +109,25 @@ func (m *WSManager) setConn(conn *WSConnection) {
 	m.Conn = conn
 }
 
+// SetPinger sets a custom pinger implementation
+func (m *WSManager) SetPinger(pinger Pinger) {
+	m.Pinger = pinger
+}
+
+// Deprecated: Use SetPinger instead
 func (m *WSManager) SetPingPayloadFunc(pingFunc func() map[string]interface{}) {
 	m.PingFunc = pingFunc
+}
+
+func (m *WSManager) getReqId(topic string) string {
+	if n, exist := m.requestIds.Get(topic); exist {
+		id := n.(int) + 1
+		m.requestIds.Set(topic, id)
+		return fmt.Sprintf("%s_%d", topic, id)
+	}
+
+	m.requestIds.Set(topic, 1)
+	return fmt.Sprintf("%s_%d", topic, 1)
 }
 
 /*
@@ -131,31 +154,24 @@ func (m *WSManager) SetConnected() bool {
 }
 
 func (m *WSManager) SetDisconnectedFromConnected() bool {
-	m.Logger.Debug("SetConnected", "from", m.GetConnState(), "to", states.StateConnected)
+	m.Logger.Debug("SetDisconnected", "from", m.GetConnState(), "to", states.StateDisconnected)
 	defer m.notifyDisconnect()
 	return changeState(states.StateConnected, states.StateDisconnected, m)
 }
 
 func (m *WSManager) SetDisconnectedFromConnecting() bool {
-	m.Logger.Debug("SetConnected", "from", m.GetConnState(), "to", states.StateConnected)
+	m.Logger.Debug("SetDisconnected", "from", m.GetConnState(), "to", states.StateDisconnected)
 	defer m.notifyDisconnect()
 	return changeState(states.StateConnecting, states.StateDisconnected, m)
 }
 
 func (m *WSManager) SetConnectingFromDisconnected() bool {
-	m.Logger.Debug("SetConnected", "from", m.GetConnState(), "to", states.StateConnected)
+	m.Logger.Debug("SetConnecting", "from", m.GetConnState(), "to", states.StateConnecting)
 	return changeState(states.StateDisconnected, states.StateConnecting, m)
 }
 
 func (m *WSManager) GetReqId(topic string) string {
-	if n, exist := m.requestIds.Get(topic); exist {
-		id := n.(int) + 1
-		m.requestIds.Set(topic, id)
-		return fmt.Sprintf("%s_%d", topic, id)
-	}
-
-	m.requestIds.Set(topic, 1)
-	return fmt.Sprintf("%s_%d", topic, 1)
+	return m.getReqId(topic)
 }
 
 func (m *WSManager) notifyDisconnect() {
@@ -178,6 +194,7 @@ func NewWSManager(url string, parentCtx context.Context) *WSManager {
 
 		DataCh:        make(chan any, 100),
 		DisconnectSig: make(chan struct{}, 1),
+		Pinger:        NewDefaultPinger(), // Use default pinger
 	}
 	return wsm
 }
@@ -190,7 +207,7 @@ func (m *WSManager) refreshContext() error {
 	m.disconnectWg.Wait()
 	select {
 	case <-m.parentCtx.Done():
-		return fmt.Errorf("parent context done: %w", m.parentCtx.Err())
+		return fmt.Errorf("parent context done:  %w", m.parentCtx.Err())
 	case <-m.ctx.Done():
 		m.ctx, m.ctxCancel = context.WithCancel(m.parentCtx)
 	default:
@@ -285,61 +302,13 @@ func (m *WSManager) Connect() error {
 	m.disconnectWg.Add(1)
 	go func() {
 		defer m.disconnectWg.Done()
-		m.pingLoop()
+		onError := func() {
+			m.SetDisconnectedFromConnected()
+		}
+		m.Pinger.Start(m.ctx, conn, m.Logger, m.getReqId, onError)
 	}()
 
 	return nil
-}
-
-func (m *WSManager) pingLoop() {
-	m.Logger.Debug("Starting pingLoop")
-	defer m.Logger.Debug("Exiting pingLoop")
-
-	ticker := time.NewTicker(wsPingInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-
-		case <-m.ctx.Done():
-			m.Logger.Debug("pingLoop context done, exiting")
-			return
-		case <-ticker.C:
-
-			pingBeingSent := false
-			it := time.NewTicker(5 * time.Second)
-			for range 5 {
-				select {
-				case <-m.ctx.Done():
-					m.Logger.Debug("pingLoop context done, exiting")
-					return
-				case <-it.C:
-					var payload map[string]interface{}
-					if m.PingFunc == nil {
-						payload = map[string]interface{}{
-							"req_id": m.getReqId("ping"),
-							"op":     "ping",
-						}
-					} else {
-						payload = m.PingFunc()
-					}
-					err := m.SendRequest(payload)
-					if err != nil {
-						m.Logger.Error("failed to send ping message", "error", err)
-					} else {
-						m.Logger.Debug("Ping message sent")
-						pingBeingSent = true
-						break
-					}
-				}
-			}
-			if !pingBeingSent {
-				m.Logger.Error("failed to send ping message after retries, setting disconnected")
-				m.SetDisconnectedFromConnected()
-				return
-			}
-		}
-	}
 }
 
 func (m *WSManager) readMessages() {
@@ -396,7 +365,6 @@ func (m *WSManager) readMessages() {
 						return
 					}
 					m.Logger.Error("failed to get reader", "error", err, "Conn state", m.GetConnState().String())
-					time.Sleep(1 * time.Millisecond)
 					return
 				}
 
@@ -416,7 +384,11 @@ func (m *WSManager) readMessages() {
 
 				var data any
 				if err := json.Unmarshal(b.Bytes(), &data); err != nil {
-					m.Logger.Error("failed to get topic", "error", err)
+					m.Logger.Error("failed to unmarshal message", "error", err)
+					return
+				}
+
+				if m.Pinger != nil && m.Pinger.HandleMessage(m.ctx, conn, data, m.Logger) {
 					return
 				}
 
@@ -434,6 +406,10 @@ func (m *WSManager) readMessages() {
 func (m *WSManager) Close() error {
 	fmt.Println("Closing WSManager")
 	m.SetDisconnectedFromConnected()
+
+	if m.Pinger != nil {
+		m.Pinger.Stop()
+	}
 
 	m.ctxCancel()
 	conn := m.getConn()

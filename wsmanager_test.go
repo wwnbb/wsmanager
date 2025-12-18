@@ -95,27 +95,22 @@ func TestInvalidStateTransitions(t *testing.T) {
 	ctx := context.Background()
 	wsm := wsmanager.NewWSManager("wss://example.com/ws", ctx)
 
-	// Move to Connected state
 	wsm.SetConnecting()
 	wsm.SetConnected()
 
-	// Try to set connected when already connected (should fail)
 	if wsm.SetConnected() {
 		t.Error("Expected transition from Connected to Connected to fail")
 	}
 
-	// Try to set connecting from disconnected when not disconnected (should fail since we're connected)
 	if wsm.SetConnectingFromDisconnected() {
 		t.Error("Expected SetConnectingFromDisconnected to fail when in Connected state")
 	}
 
-	// State should still be Connected
 	if wsm.GetConnState() != states.StateConnected {
 		t.Errorf("Expected StateConnected, got %v", wsm.GetConnState())
 	}
 }
 
-// TestSendRequestWithoutConnection tests sending a request without a connection
 func TestSendRequestWithoutConnection(t *testing.T) {
 	ctx := context.Background()
 	wsm := wsmanager.NewWSManager("wss://example.com/ws", ctx)
@@ -182,7 +177,6 @@ func TestConcurrentStateAccess(t *testing.T) {
 		}()
 	}
 
-	// Concurrent state transitions
 	for i := 0; i < 10; i++ {
 		wg.Add(1)
 		go func() {
@@ -194,7 +188,6 @@ func TestConcurrentStateAccess(t *testing.T) {
 	wg.Wait()
 }
 
-// TestDataChannelCapacity tests that the data channel has proper capacity
 func TestDataChannelCapacity(t *testing.T) {
 	ctx := context.Background()
 	wsm := wsmanager.NewWSManager("wss://example.com/ws", ctx)
@@ -224,7 +217,6 @@ func TestConnectToMockServer(t *testing.T) {
 	server := mockWebSocketServer(t, func(conn *websocket.Conn) {
 		ctx := context.Background()
 
-		// Read one message
 		_, _, err := conn.Read(ctx)
 		if err == nil {
 			received <- true
@@ -262,7 +254,6 @@ func TestConnectToMockServer(t *testing.T) {
 	}
 }
 
-// TestReconnect tests reconnecting after closing
 func TestReconnect(t *testing.T) {
 	messageCount := 0
 	mu := sync.Mutex{}
@@ -278,7 +269,6 @@ func TestReconnect(t *testing.T) {
 			messageCount++
 			mu.Unlock()
 
-			// Echo back
 			conn.Write(ctx, websocket.MessageText, msg)
 		}
 	})
@@ -289,7 +279,6 @@ func TestReconnect(t *testing.T) {
 	wsm := wsmanager.NewWSManager(url, ctx)
 	wsm.SetLogger(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})))
 
-	// First connection
 	err := wsm.Connect()
 	if err != nil {
 		t.Fatalf("First connect failed: %v", err)
@@ -302,7 +291,6 @@ func TestReconnect(t *testing.T) {
 
 	time.Sleep(100 * time.Millisecond)
 
-	// Close
 	wsm.Close()
 	time.Sleep(100 * time.Millisecond)
 
@@ -310,7 +298,6 @@ func TestReconnect(t *testing.T) {
 		t.Errorf("Expected StateDisconnected after close, got %v", wsm.GetConnState())
 	}
 
-	// Reconnect
 	err = wsm.Connect()
 	if err != nil {
 		t.Fatalf("Reconnect failed: %v", err)
@@ -335,7 +322,6 @@ func TestReconnect(t *testing.T) {
 	}
 }
 
-// TestReceiveMessages tests receiving messages from server
 func TestReceiveMessages(t *testing.T) {
 	testMessage := `{"type":"test","data":"hello"}`
 
@@ -343,14 +329,12 @@ func TestReceiveMessages(t *testing.T) {
 		ctx := context.Background()
 		time.Sleep(100 * time.Millisecond)
 
-		// Send test message
 		err := conn.Write(ctx, websocket.MessageText, []byte(testMessage))
 		if err != nil {
 			t.Logf("Failed to write message: %v", err)
 			return
 		}
 
-		// Keep connection alive
 		time.Sleep(1 * time.Second)
 	})
 	defer server.Close()
@@ -366,13 +350,11 @@ func TestReceiveMessages(t *testing.T) {
 	}
 	defer wsm.Close()
 
-	// Wait for message
 	select {
 	case msg := <-wsm.DataCh:
 		if msg == nil {
 			t.Error("Received nil message")
 		}
-		// Verify message is a map
 		if _, ok := msg.(map[string]interface{}); !ok {
 			t.Errorf("Expected map[string]interface{}, got %T", msg)
 		}
@@ -381,7 +363,6 @@ func TestReceiveMessages(t *testing.T) {
 	}
 }
 
-// TestMultipleConcurrentConnects tests that multiple concurrent connect attempts are handled
 func TestMultipleConcurrentConnects(t *testing.T) {
 	server := mockWebSocketServer(t, func(conn *websocket.Conn) {
 		time.Sleep(2 * time.Second)
@@ -396,7 +377,6 @@ func TestMultipleConcurrentConnects(t *testing.T) {
 	var wg sync.WaitGroup
 	errors := make([]error, 3)
 
-	// Try to connect 3 times concurrently
 	for i := 0; i < 3; i++ {
 		wg.Add(1)
 		go func(idx int) {
@@ -407,7 +387,6 @@ func TestMultipleConcurrentConnects(t *testing.T) {
 
 	wg.Wait()
 
-	// At least one should succeed
 	successCount := 0
 	for _, err := range errors {
 		if err == nil {
@@ -422,16 +401,13 @@ func TestMultipleConcurrentConnects(t *testing.T) {
 	wsm.Close()
 }
 
-// TestConnectFromConnectingState tests attempting to connect when already connecting
 func TestConnectFromConnectingState(t *testing.T) {
 	ctx := context.Background()
 	wsm := wsmanager.NewWSManager("wss://example.com/ws", ctx)
 	wsm.SetLogger(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})))
 
-	// Manually set to connecting state
 	wsm.SetConnecting()
 
-	// Try to connect when already connecting (should fail)
 	err := wsm.Connect()
 	if err == nil {
 		t.Error("Expected error when connecting from Connecting state")
@@ -442,7 +418,6 @@ func TestConnectFromConnectingState(t *testing.T) {
 	}
 }
 
-// TestConnectFromConnectedState tests attempting to connect when already connected
 func TestConnectFromConnectedState(t *testing.T) {
 	server := mockWebSocketServer(t, func(conn *websocket.Conn) {
 		time.Sleep(2 * time.Second)
@@ -454,7 +429,6 @@ func TestConnectFromConnectedState(t *testing.T) {
 	wsm := wsmanager.NewWSManager(url, ctx)
 	wsm.SetLogger(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})))
 
-	// First connection
 	err := wsm.Connect()
 	if err != nil {
 		t.Fatalf("First connect failed: %v", err)
@@ -463,19 +437,16 @@ func TestConnectFromConnectedState(t *testing.T) {
 
 	time.Sleep(100 * time.Millisecond)
 
-	// Try to connect again (should fail)
 	err = wsm.Connect()
 	if err == nil {
 		t.Error("Expected error when connecting from Connected state")
 	}
 }
 
-// TestSendRequestNilConnection tests sending request when connection is nil
 func TestSendRequestNilConnection(t *testing.T) {
 	ctx := context.Background()
 	wsm := wsmanager.NewWSManager("wss://example.com/ws", ctx)
 
-	// Manually set to connected state without actual connection
 	wsm.SetConnecting()
 	wsm.SetConnected()
 
@@ -490,12 +461,10 @@ func TestSendRequestNilConnection(t *testing.T) {
 	}
 }
 
-// TestServerClosesConnection tests handling when server closes the connection
 func TestServerClosesConnection(t *testing.T) {
 	serverClosed := make(chan bool, 1)
 
 	server := mockWebSocketServer(t, func(conn *websocket.Conn) {
-		// Close immediately after accepting
 		time.Sleep(100 * time.Millisecond)
 		conn.Close(websocket.StatusNormalClosure, "server closing")
 		serverClosed <- true
@@ -513,35 +482,28 @@ func TestServerClosesConnection(t *testing.T) {
 	}
 	defer wsm.Close()
 
-	// Wait for server to close
 	select {
 	case <-serverClosed:
-		// Server closed
 	case <-time.After(2 * time.Second):
 		t.Error("Server did not close connection")
 	}
 
-	// Give time for client to detect closure
 	time.Sleep(200 * time.Millisecond)
 
-	// Try to send a message (should fail or connection should be disconnected)
 	msg := map[string]interface{}{"test": "data"}
 	err = wsm.SendRequest(msg)
 
-	// Either SendRequest fails or state changes to disconnected
 	if err == nil && wsm.GetConnState() == states.StateConnected {
 		t.Error("Expected error or state change after server closure")
 	}
 }
 
-// TestDataChannelFull tests behavior when data channel is full
 func TestDataChannelFull(t *testing.T) {
 	messagesSent := 0
 	mu := sync.Mutex{}
 
 	server := mockWebSocketServer(t, func(conn *websocket.Conn) {
 		ctx := context.Background()
-		// Send many messages quickly
 		for i := 0; i < 150; i++ {
 			msg := fmt.Sprintf(`{"id":%d}`, i)
 			err := conn.Write(ctx, websocket.MessageText, []byte(msg))
@@ -568,7 +530,6 @@ func TestDataChannelFull(t *testing.T) {
 	}
 	defer wsm.Close()
 
-	// Don't read from channel to make it fill up
 	time.Sleep(2 * time.Second)
 
 	mu.Lock()
@@ -578,10 +539,8 @@ func TestDataChannelFull(t *testing.T) {
 	if sent == 0 {
 		t.Error("No messages were sent by server")
 	}
-	// Test passes if no crash occurs when channel is full
 }
 
-// TestConcurrentSendRequests tests sending requests concurrently
 func TestConcurrentSendRequests(t *testing.T) {
 	messageCount := int32(0)
 
@@ -610,7 +569,6 @@ func TestConcurrentSendRequests(t *testing.T) {
 
 	time.Sleep(100 * time.Millisecond)
 
-	// Send messages concurrently
 	var wg sync.WaitGroup
 	numMessages := 10
 
@@ -632,7 +590,6 @@ func TestConcurrentSendRequests(t *testing.T) {
 	}
 }
 
-// TestCloseMultipleTimes tests calling Close multiple times
 func TestCloseMultipleTimes(t *testing.T) {
 	server := mockWebSocketServer(t, func(conn *websocket.Conn) {
 		time.Sleep(2 * time.Second)
@@ -651,7 +608,6 @@ func TestCloseMultipleTimes(t *testing.T) {
 
 	time.Sleep(100 * time.Millisecond)
 
-	// Close multiple times
 	for i := 0; i < 3; i++ {
 		err = wsm.Close()
 		if err != nil {
@@ -660,7 +616,6 @@ func TestCloseMultipleTimes(t *testing.T) {
 	}
 }
 
-// Integration test with real server (kept from original)
 func TestCreateWsManager(t *testing.T) {
 	url := "wss://stream.bybit.com/v5/public/spot"
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
@@ -701,7 +656,6 @@ func TestCreateWsManager(t *testing.T) {
 	wsm.Close()
 	time.Sleep(1 * time.Second)
 
-	// Test reconnection
 	err = wsm.Connect()
 	if err != nil {
 		t.Fatalf("Reconnect failed: %v", err)
