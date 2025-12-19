@@ -2,7 +2,9 @@ package wsmanager
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -33,6 +35,10 @@ type WSConnection struct {
 
 	writeMu sync.Mutex
 	pingMu  sync.Mutex
+}
+
+func (c *WSConnection) GetConn() *websocket.Conn {
+	return c.Conn
 }
 
 func (c *WSConnection) getLastPing() time.Time {
@@ -119,7 +125,7 @@ func (m *WSManager) SetPingPayloadFunc(pingFunc func() map[string]interface{}) {
 	m.PingFunc = pingFunc
 }
 
-func (m *WSManager) getReqId(topic string) string {
+func (m *WSManager) GetReqId(topic string) string {
 	if n, exist := m.requestIds.Get(topic); exist {
 		id := n.(int) + 1
 		m.requestIds.Set(topic, id)
@@ -168,10 +174,6 @@ func (m *WSManager) SetDisconnectedFromConnecting() bool {
 func (m *WSManager) SetConnectingFromDisconnected() bool {
 	m.Logger.Debug("SetConnecting", "from", m.GetConnState(), "to", states.StateConnecting)
 	return changeState(states.StateDisconnected, states.StateConnecting, m)
-}
-
-func (m *WSManager) GetReqId(topic string) string {
-	return m.getReqId(topic)
 }
 
 func (m *WSManager) notifyDisconnect() {
@@ -305,10 +307,48 @@ func (m *WSManager) Connect() error {
 		onError := func() {
 			m.SetDisconnectedFromConnected()
 		}
-		m.Pinger.Start(m.ctx, conn, m.Logger, m.getReqId, onError)
+		m.Pinger.Start(m.ctx, conn, m.Logger, m.GetReqId, onError)
 	}()
 
 	return nil
+}
+
+func (m *WSManager) handleReaderError(err error) {
+	var closeErr websocket.CloseError
+	if errors.As(err, &closeErr) {
+		switch closeErr.Code {
+		case websocket.StatusNormalClosure, websocket.StatusGoingAway:
+			m.Logger.Debug("connection closed normally", "code", closeErr.Code, "reason", closeErr.Reason)
+			return
+		case websocket.StatusAbnormalClosure:
+			m.Logger.Error("abnormal connection closure", "code", closeErr.Code, "reason", closeErr.Reason)
+			m.SetDisconnectedFromConnected()
+			return
+		default:
+			m.Logger.Error("connection closed with error", "code", closeErr.Code, "reason", closeErr.Reason)
+			m.SetDisconnectedFromConnected()
+			return
+		}
+	}
+
+	if errors.Is(err, net.ErrClosed) {
+		m.Logger.Debug("connection already closed")
+		return
+	}
+
+	if errors.Is(err, context.DeadlineExceeded) {
+		m.Logger.Debug("read context deadline exceeded")
+		return
+	}
+	if errors.Is(err, context.Canceled) {
+		m.Logger.Debug("read context canceled")
+		return
+	}
+
+	m.Logger.Error("failed to get reader", "error", err, "conn_state", m.GetConnState().String())
+	m.SetDisconnectedFromConnected()
+	return
+
 }
 
 func (m *WSManager) readMessages() {
@@ -353,18 +393,7 @@ func (m *WSManager) readMessages() {
 
 				_, reader, err := conn.Conn.Reader(readDataCtx)
 				if err != nil {
-					if strings.Contains(err.Error(), "use of closed network connection") {
-						m.Logger.Error("failed to get reader", "error", err, "Conn state", m.GetConnState().String())
-						m.SetDisconnectedFromConnected()
-						return
-					}
-
-					if strings.Contains(err.Error(), "context deadline exceeded") {
-						return
-					} else if strings.Contains(err.Error(), "context canceled") {
-						return
-					}
-					m.Logger.Error("failed to get reader", "error", err, "Conn state", m.GetConnState().String())
+					m.handleReaderError(err)
 					return
 				}
 
