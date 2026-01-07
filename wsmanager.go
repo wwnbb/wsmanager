@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"strings"
@@ -73,12 +74,6 @@ func (c *WSManager) GetConnState() states.ConnectionState {
 	return states.ConnectionState(atomic.LoadInt32((*int32)(&c.connState)))
 }
 
-type WsMsg struct {
-	Topic string
-	Op    string
-	Data  interface{}
-}
-
 type WSManager struct {
 	Logger *slog.Logger
 
@@ -90,17 +85,14 @@ type WSManager struct {
 	Conn      *WSConnection
 	url       string
 
-	DataCh        chan any
+	DataCh        chan json.RawMessage
 	DisconnectSig chan struct{}
 	disconnectWg  sync.WaitGroup
 
 	requestIds lockfree.HashMap
 	connMu     sync.RWMutex
 
-	// Pinger handles the ping logic
 	Pinger Pinger
-	// Deprecated: Use Pinger instead
-	PingFunc func() map[string]interface{}
 }
 
 func (m *WSManager) getConn() *WSConnection {
@@ -115,14 +107,8 @@ func (m *WSManager) setConn(conn *WSConnection) {
 	m.Conn = conn
 }
 
-// SetPinger sets a custom pinger implementation
 func (m *WSManager) SetPinger(pinger Pinger) {
 	m.Pinger = pinger
-}
-
-// Deprecated: Use SetPinger instead
-func (m *WSManager) SetPingPayloadFunc(pingFunc func() map[string]interface{}) {
-	m.PingFunc = pingFunc
 }
 
 func (m *WSManager) GetReqId(topic string) string {
@@ -183,8 +169,12 @@ func (m *WSManager) notifyDisconnect() {
 	}
 }
 
-func NewWSManager(url string, parentCtx context.Context) *WSManager {
+func NewWSManager(url string, parentCtx context.Context, DataChSize ...int) *WSManager {
 	ctx, cancel := context.WithCancel(parentCtx)
+	var chSz int = 1000
+	if len(DataChSize) > 0 && DataChSize[0] > 0 {
+		chSz = DataChSize[0]
+	}
 	wsm := &WSManager{
 		requestIds: lockfree.NewHashMap(),
 		url:        url,
@@ -194,7 +184,7 @@ func NewWSManager(url string, parentCtx context.Context) *WSManager {
 		Logger:     slog.Default(),
 		ctxCancel:  cancel,
 
-		DataCh:        make(chan any, 100),
+		DataCh:        make(chan json.RawMessage, chSz),
 		DisconnectSig: make(chan struct{}, 1),
 		Pinger:        NewDefaultPinger(), // Use default pinger
 	}
@@ -203,6 +193,10 @@ func NewWSManager(url string, parentCtx context.Context) *WSManager {
 
 func (m *WSManager) SetLogger(Logger *slog.Logger) {
 	m.Logger = Logger
+}
+
+func (m *WSManager) SetProductionLogger() {
+	m.SetLogger(slog.New(slog.NewTextHandler(io.Discard, nil)))
 }
 
 func (m *WSManager) refreshContext() error {
@@ -388,10 +382,7 @@ func (m *WSManager) readMessages() {
 					}
 				}()
 
-				readDataCtx, cancelData := context.WithCancel(m.ctx)
-				defer cancelData()
-
-				_, reader, err := conn.Conn.Reader(readDataCtx)
+				_, reader, err := conn.Conn.Reader(m.ctx)
 				if err != nil {
 					m.handleReaderError(err)
 					return
@@ -411,7 +402,7 @@ func (m *WSManager) readMessages() {
 					return
 				}
 
-				var data any
+				var data json.RawMessage
 				if err := json.Unmarshal(b.Bytes(), &data); err != nil {
 					m.Logger.Error("failed to unmarshal message", "error", err)
 					return
@@ -469,6 +460,8 @@ func (m *WSManager) SendRequest(v interface{}) error {
 		m.Logger.Error("failed to send message", "error", err)
 		m.SetDisconnectedFromConnected()
 		return fmt.Errorf("failed to send message: %w", err)
+	} else {
+		m.Logger.Debug("sent message", "data", pp.PrettyFormat(v))
 	}
 	return nil
 }

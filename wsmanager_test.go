@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
+	json "github.com/goccy/go-json"
 	pp "github.com/wwnbb/pprint"
 	"github.com/wwnbb/wsmanager"
 	"github.com/wwnbb/wsmanager/states"
@@ -192,8 +193,8 @@ func TestDataChannelCapacity(t *testing.T) {
 	ctx := context.Background()
 	wsm := wsmanager.NewWSManager("wss://example.com/ws", ctx)
 
-	if cap(wsm.DataCh) != 100 {
-		t.Errorf("Expected DataCh capacity of 100, got %d", cap(wsm.DataCh))
+	if cap(wsm.DataCh) != 1000 {
+		t.Errorf("Expected DataCh capacity of 1000, got %d", cap(wsm.DataCh))
 	}
 }
 
@@ -352,11 +353,12 @@ func TestReceiveMessages(t *testing.T) {
 
 	select {
 	case msg := <-wsm.DataCh:
-		if msg == nil {
-			t.Error("Received nil message")
+		if len(msg) == 0 {
+			t.Error("Received empty message")
 		}
-		if _, ok := msg.(map[string]interface{}); !ok {
-			t.Errorf("Expected map[string]interface{}, got %T", msg)
+		var data map[string]interface{}
+		if err := json.Unmarshal(msg, &data); err != nil {
+			t.Errorf("Failed to unmarshal message: %v", err)
 		}
 	case <-time.After(2 * time.Second):
 		t.Error("Did not receive message from server")
@@ -696,7 +698,7 @@ func TestConnectDisconnect(t *testing.T) {
 	subscribeMsg := map[string]interface{}{
 		"req_id": "test",
 		"op":     "subscribe",
-		"args":   []string{"orderbook.1.BTCUSDT"},
+		"args":   []string{"publicTrade.BTCUSDT"},
 	}
 	err = wsm.SendRequest(subscribeMsg)
 	if err != nil {

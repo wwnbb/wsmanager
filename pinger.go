@@ -2,10 +2,12 @@ package wsmanager
 
 import (
 	"context"
-	"github.com/coder/websocket/wsjson"
+	json "github.com/goccy/go-json"
 	"log/slog"
 	"sync"
 	"time"
+
+	"github.com/coder/websocket/wsjson"
 )
 
 const (
@@ -17,7 +19,7 @@ type Pinger interface {
 	HandleMessage(
 		ctx context.Context,
 		conn *WSConnection,
-		data any,
+		data json.RawMessage,
 		logger *slog.Logger,
 	) bool
 	Stop()
@@ -94,7 +96,7 @@ func (p *DefaultPinger) Start(ctx context.Context, conn *WSConnection, logger *s
 	}()
 }
 
-func (p *DefaultPinger) HandleMessage(ctx context.Context, conn *WSConnection, data any, logger *slog.Logger) bool {
+func (p *DefaultPinger) HandleMessage(ctx context.Context, conn *WSConnection, data json.RawMessage, logger *slog.Logger) bool {
 	return false
 }
 
