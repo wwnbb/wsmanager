@@ -91,6 +91,7 @@ type WSManager struct {
 
 	requestIds lockfree.HashMap
 	connMu     sync.RWMutex
+	connectMu  sync.Mutex
 
 	Pinger Pinger
 }
@@ -105,6 +106,29 @@ func (m *WSManager) setConn(conn *WSConnection) {
 	m.connMu.Lock()
 	defer m.connMu.Unlock()
 	m.Conn = conn
+}
+
+func (m *WSManager) closeConn(closeCode websocket.StatusCode, reason string) {
+	conn := m.getConn()
+	if conn == nil {
+		return
+	}
+
+	m.setConn(nil)
+	if conn.cancel != nil {
+		conn.cancel()
+	}
+	if conn.Conn != nil {
+		_ = conn.Conn.Close(closeCode, reason)
+		conn.Conn.CloseNow()
+	}
+}
+
+func (m *WSManager) teardownConnection(closeCode websocket.StatusCode, reason string) {
+	if m.Pinger != nil {
+		m.Pinger.Stop()
+	}
+	m.closeConn(closeCode, reason)
 }
 
 func (m *WSManager) SetPinger(pinger Pinger) {
@@ -137,7 +161,13 @@ func changeState(from, to states.ConnectionState, m *WSManager) bool {
 
 func (m *WSManager) SetConnecting() bool {
 	m.Logger.Debug("SetConnecting", "from", m.GetConnState(), "to", states.StateConnecting)
-	return changeState(m.GetConnState(), states.StateConnecting, m)
+	currentState := m.GetConnState()
+	switch currentState {
+	case states.StateNew, states.StateDisconnected:
+		return changeState(currentState, states.StateConnecting, m)
+	default:
+		return false
+	}
 }
 
 func (m *WSManager) SetConnected() bool {
@@ -145,16 +175,23 @@ func (m *WSManager) SetConnected() bool {
 	return changeState(states.StateConnecting, states.StateConnected, m)
 }
 
+func (m *WSManager) setDisconnected(from states.ConnectionState, reason string) bool {
+	m.Logger.Debug("SetDisconnected", "from", m.GetConnState(), "to", states.StateDisconnected, "reason", reason)
+	if !changeState(from, states.StateDisconnected, m) {
+		return false
+	}
+
+	m.teardownConnection(websocket.StatusNormalClosure, reason)
+	m.notifyDisconnect()
+	return true
+}
+
 func (m *WSManager) SetDisconnectedFromConnected() bool {
-	m.Logger.Debug("SetDisconnected", "from", m.GetConnState(), "to", states.StateDisconnected)
-	defer m.notifyDisconnect()
-	return changeState(states.StateConnected, states.StateDisconnected, m)
+	return m.setDisconnected(states.StateConnected, "connection lost")
 }
 
 func (m *WSManager) SetDisconnectedFromConnecting() bool {
-	m.Logger.Debug("SetDisconnected", "from", m.GetConnState(), "to", states.StateDisconnected)
-	defer m.notifyDisconnect()
-	return changeState(states.StateConnecting, states.StateDisconnected, m)
+	return m.setDisconnected(states.StateConnecting, "connect failed")
 }
 
 func (m *WSManager) SetConnectingFromDisconnected() bool {
@@ -213,6 +250,9 @@ func (m *WSManager) refreshContext() error {
 }
 
 func (m *WSManager) Connect() error {
+	m.connectMu.Lock()
+	defer m.connectMu.Unlock()
+
 	currentState := m.GetConnState()
 	var transitionOk bool
 
@@ -237,12 +277,7 @@ func (m *WSManager) Connect() error {
 
 	conn := m.getConn()
 	if conn != nil {
-		if conn.cancel != nil {
-			conn.cancel()
-		}
-		if conn.Conn != nil {
-			conn.Conn.Close(1000, "Done")
-		}
+		m.teardownConnection(websocket.StatusNormalClosure, "replacing connection")
 	}
 
 	dialCtx, dialCancel := context.WithTimeout(m.ctx, 15*time.Second)
@@ -279,16 +314,14 @@ func (m *WSManager) Connect() error {
 
 	defer func() {
 		if err != nil && conn != nil {
-			if conn.cancel != nil {
-				conn.cancel()
-			}
-			if conn.Conn != nil {
-				conn.Conn.CloseNow()
-			}
+			m.teardownConnection(websocket.StatusInternalError, "connect failed")
 		}
 	}()
 
-	m.SetConnected()
+	if !m.SetConnected() {
+		err = fmt.Errorf("state transition failed from %s to %s", m.GetConnState(), states.StateConnected)
+		return err
+	}
 
 	m.disconnectWg.Add(1)
 	go func() {
@@ -301,41 +334,46 @@ func (m *WSManager) Connect() error {
 		onError := func() {
 			m.SetDisconnectedFromConnected()
 		}
-		m.Pinger.Start(m.ctx, conn, m.Logger, m.GetReqId, onError)
+		m.Pinger.Start(conn.ctx, conn, m.Logger, m.GetReqId, onError)
 	}()
 
 	return nil
 }
 
 func (m *WSManager) handleReaderError(err error) {
+	if m.GetConnState() != states.StateConnected {
+		m.Logger.Debug("reader error after disconnect", "error", err)
+		return
+	}
+
 	var closeErr websocket.CloseError
 	if errors.As(err, &closeErr) {
 		switch closeErr.Code {
 		case websocket.StatusNormalClosure, websocket.StatusGoingAway:
-			m.Logger.Debug("connection closed normally", "code", closeErr.Code, "reason", closeErr.Reason)
-			return
+			m.Logger.Warn("connection closed", "code", closeErr.Code, "reason", closeErr.Reason)
 		case websocket.StatusAbnormalClosure:
 			m.Logger.Error("abnormal connection closure", "code", closeErr.Code, "reason", closeErr.Reason)
-			m.SetDisconnectedFromConnected()
-			return
 		default:
 			m.Logger.Error("connection closed with error", "code", closeErr.Code, "reason", closeErr.Reason)
-			m.SetDisconnectedFromConnected()
-			return
 		}
+		m.SetDisconnectedFromConnected()
+		return
 	}
 
 	if errors.Is(err, net.ErrClosed) {
-		m.Logger.Debug("connection already closed")
+		m.Logger.Warn("connection already closed")
+		m.SetDisconnectedFromConnected()
 		return
 	}
 
 	if errors.Is(err, context.DeadlineExceeded) {
-		m.Logger.Debug("read context deadline exceeded")
+		m.Logger.Warn("read context deadline exceeded")
+		m.SetDisconnectedFromConnected()
 		return
 	}
 	if errors.Is(err, context.Canceled) {
-		m.Logger.Debug("read context canceled")
+		m.Logger.Warn("read context canceled")
+		m.SetDisconnectedFromConnected()
 		return
 	}
 
@@ -365,7 +403,7 @@ func (m *WSManager) readMessages() {
 
 	for {
 		select {
-		case <-m.ctx.Done():
+		case <-conn.ctx.Done():
 			m.Logger.Debug("Read messages context done, exiting")
 			return
 		default:
@@ -382,7 +420,7 @@ func (m *WSManager) readMessages() {
 					}
 				}()
 
-				_, reader, err := conn.Conn.Reader(m.ctx)
+				_, reader, err := conn.Conn.Reader(conn.ctx)
 				if err != nil {
 					m.handleReaderError(err)
 					return
@@ -399,6 +437,7 @@ func (m *WSManager) readMessages() {
 						return
 					}
 					m.Logger.Error("failed to read message", "error", err)
+					m.SetDisconnectedFromConnected()
 					return
 				}
 
@@ -426,22 +465,10 @@ func (m *WSManager) readMessages() {
 func (m *WSManager) Close() error {
 	fmt.Println("Closing WSManager")
 	m.SetDisconnectedFromConnected()
-
-	if m.Pinger != nil {
-		m.Pinger.Stop()
-	}
+	m.SetDisconnectedFromConnecting()
 
 	m.ctxCancel()
-	conn := m.getConn()
-	if conn != nil {
-		if conn.cancel != nil {
-			conn.cancel()
-		}
-		if conn.Conn != nil {
-			fmt.Println("Closing websocket connection")
-			conn.Conn.Close(1000, "done")
-		}
-	}
+	m.teardownConnection(websocket.StatusNormalClosure, "done")
 	return nil
 }
 

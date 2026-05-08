@@ -198,6 +198,49 @@ func TestDataChannelCapacity(t *testing.T) {
 	}
 }
 
+type persistentFailingPinger struct {
+	pingCalls atomic.Int32
+	stopCalls atomic.Int32
+	stopCh    chan struct{}
+	stopOnce  sync.Once
+}
+
+func newPersistentFailingPinger() *persistentFailingPinger {
+	return &persistentFailingPinger{
+		stopCh: make(chan struct{}),
+	}
+}
+
+func (p *persistentFailingPinger) Start(ctx context.Context, conn *wsmanager.WSConnection, logger *slog.Logger, reqIdFunc func(topic string) string, onError func()) {
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-p.stopCh:
+			return
+		case <-ticker.C:
+			p.pingCalls.Add(1)
+			if onError != nil {
+				onError()
+			}
+		}
+	}
+}
+
+func (p *persistentFailingPinger) HandleMessage(ctx context.Context, conn *wsmanager.WSConnection, data json.RawMessage, logger *slog.Logger) bool {
+	return false
+}
+
+func (p *persistentFailingPinger) Stop() {
+	p.stopCalls.Add(1)
+	p.stopOnce.Do(func() {
+		close(p.stopCh)
+	})
+}
+
 func mockWebSocketServer(t *testing.T, handler func(*websocket.Conn)) *httptest.Server {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		conn, err := websocket.Accept(w, r, nil)
@@ -252,6 +295,49 @@ func TestConnectToMockServer(t *testing.T) {
 	case <-received:
 	case <-time.After(2 * time.Second):
 		t.Error("Server did not receive message")
+	}
+}
+
+func TestDisconnectStopsPingerAndSignalsOnce(t *testing.T) {
+	server := mockWebSocketServer(t, func(conn *websocket.Conn) {
+		time.Sleep(2 * time.Second)
+	})
+	defer server.Close()
+
+	url := "ws" + strings.TrimPrefix(server.URL, "http")
+	ctx := context.Background()
+	wsm := wsmanager.NewWSManager(url, ctx)
+	wsm.SetLogger(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})))
+
+	pinger := newPersistentFailingPinger()
+	wsm.SetPinger(pinger)
+
+	if err := wsm.Connect(); err != nil {
+		t.Fatalf("Failed to connect: %v", err)
+	}
+
+	select {
+	case <-wsm.DisconnectSig:
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected disconnect signal")
+	}
+
+	time.Sleep(100 * time.Millisecond)
+
+	select {
+	case <-wsm.DisconnectSig:
+		t.Fatal("received duplicate disconnect signal")
+	default:
+	}
+
+	if wsm.GetConnState() != states.StateDisconnected {
+		t.Fatalf("expected disconnected state, got %v", wsm.GetConnState())
+	}
+	if pinger.stopCalls.Load() == 0 {
+		t.Fatal("expected pinger to be stopped")
+	}
+	if pinger.pingCalls.Load() > 2 {
+		t.Fatalf("expected ping loop to stop quickly, got %d ping attempts", pinger.pingCalls.Load())
 	}
 }
 
