@@ -2,7 +2,6 @@ package wsmanager
 
 import (
 	"context"
-	json "github.com/goccy/go-json"
 	"log/slog"
 	"sync"
 	"time"
@@ -19,7 +18,7 @@ type Pinger interface {
 	HandleMessage(
 		ctx context.Context,
 		conn *WSConnection,
-		data json.RawMessage,
+		frame ReceivedFrame,
 		logger *slog.Logger,
 	) bool
 	Stop()
@@ -119,7 +118,7 @@ func (p *DefaultPinger) Start(ctx context.Context, conn *WSConnection, logger *s
 	}
 }
 
-func (p *DefaultPinger) HandleMessage(ctx context.Context, conn *WSConnection, data json.RawMessage, logger *slog.Logger) bool {
+func (p *DefaultPinger) HandleMessage(ctx context.Context, conn *WSConnection, frame ReceivedFrame, logger *slog.Logger) bool {
 	return false
 }
 

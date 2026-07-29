@@ -230,7 +230,7 @@ func (p *persistentFailingPinger) Start(ctx context.Context, conn *wsmanager.WSC
 	}
 }
 
-func (p *persistentFailingPinger) HandleMessage(ctx context.Context, conn *wsmanager.WSConnection, data json.RawMessage, logger *slog.Logger) bool {
+func (p *persistentFailingPinger) HandleMessage(ctx context.Context, conn *wsmanager.WSConnection, frame wsmanager.ReceivedFrame, logger *slog.Logger) bool {
 	return false
 }
 
@@ -240,6 +240,21 @@ func (p *persistentFailingPinger) Stop() {
 		close(p.stopCh)
 	})
 }
+
+type observingPinger struct {
+	frames chan struct{}
+}
+
+func (p *observingPinger) Start(ctx context.Context, conn *wsmanager.WSConnection, logger *slog.Logger, reqIdFunc func(topic string) string, onError func()) {
+	<-ctx.Done()
+}
+
+func (p *observingPinger) HandleMessage(ctx context.Context, conn *wsmanager.WSConnection, frame wsmanager.ReceivedFrame, logger *slog.Logger) bool {
+	p.frames <- struct{}{}
+	return false
+}
+
+func (p *observingPinger) Stop() {}
 
 func mockWebSocketServer(t *testing.T, handler func(*websocket.Conn)) *httptest.Server {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -439,11 +454,11 @@ func TestReceiveMessages(t *testing.T) {
 
 	select {
 	case msg := <-wsm.DataCh:
-		if len(msg) == 0 {
+		if len(msg.Data) == 0 {
 			t.Error("Received empty message")
 		}
 		var data map[string]interface{}
-		if err := json.Unmarshal(msg, &data); err != nil {
+		if err := json.Unmarshal(msg.Data, &data); err != nil {
 			t.Errorf("Failed to unmarshal message: %v", err)
 		}
 	case <-time.After(2 * time.Second):
@@ -586,46 +601,109 @@ func TestServerClosesConnection(t *testing.T) {
 	}
 }
 
-func TestDataChannelFull(t *testing.T) {
-	messagesSent := 0
-	mu := sync.Mutex{}
-
+func TestDataChannelDrainsBlockedFrameOnClose(t *testing.T) {
 	server := mockWebSocketServer(t, func(conn *websocket.Conn) {
 		ctx := context.Background()
-		for i := 0; i < 150; i++ {
+		for i := 0; i < 2; i++ {
 			msg := fmt.Sprintf(`{"id":%d}`, i)
-			err := conn.Write(ctx, websocket.MessageText, []byte(msg))
-			if err != nil {
+			if err := conn.Write(ctx, websocket.MessageText, []byte(msg)); err != nil {
 				return
 			}
-			mu.Lock()
-			messagesSent++
-			mu.Unlock()
-			time.Sleep(1 * time.Millisecond)
 		}
-		time.Sleep(1 * time.Second)
+		_, _, _ = conn.Read(ctx)
 	})
 	defer server.Close()
 
 	url := "ws" + strings.TrimPrefix(server.URL, "http")
-	ctx := context.Background()
-	wsm := wsmanager.NewWSManager(url, ctx)
+	wsm := wsmanager.NewWSManager(url, context.Background(), 1)
 	wsm.SetLogger(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})))
+	observer := &observingPinger{frames: make(chan struct{}, 2)}
+	wsm.SetPinger(observer)
 
-	err := wsm.Connect()
-	if err != nil {
+	if err := wsm.Connect(); err != nil {
 		t.Fatalf("Connect failed: %v", err)
+	}
+	for i := 0; i < 2; i++ {
+		select {
+		case <-observer.frames:
+		case <-time.After(3 * time.Second):
+			t.Fatalf("reader did not reach frame %d", i)
+		}
+	}
+	if err := wsm.Close(); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	go func() {
+		wsm.Wait()
+		close(done)
+	}()
+	for i := 0; i < 2; i++ {
+		select {
+		case frame := <-wsm.DataCh:
+			want := fmt.Sprintf(`{"id":%d}`, i)
+			if string(frame.Data) != want {
+				t.Fatalf("frame %d = %s, want %s", i, frame.Data, want)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatalf("timed out draining frame %d", i)
+		}
+	}
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Wait did not return after DataCh was drained")
+	}
+}
+
+func TestDataChannelPreservesFramesAndReceiptTime(t *testing.T) {
+	const count = 150
+	server := mockWebSocketServer(t, func(conn *websocket.Conn) {
+		ctx := context.Background()
+		for i := 0; i < count; i++ {
+			messageType := websocket.MessageText
+			if i%2 != 0 {
+				messageType = websocket.MessageBinary
+			}
+			msg := fmt.Sprintf("frame-%d", i)
+			if err := conn.Write(ctx, messageType, []byte(msg)); err != nil {
+				return
+			}
+		}
+	})
+	defer server.Close()
+
+	url := "ws" + strings.TrimPrefix(server.URL, "http")
+	wsm := wsmanager.NewWSManager(url, context.Background(), 1)
+	if err := wsm.Connect(); err != nil {
+		t.Fatal(err)
 	}
 	defer wsm.Close()
 
-	time.Sleep(2 * time.Second)
-
-	mu.Lock()
-	sent := messagesSent
-	mu.Unlock()
-
-	if sent == 0 {
-		t.Error("No messages were sent by server")
+	frames := make([]wsmanager.ReceivedFrame, 0, count)
+	for i := 0; i < count; i++ {
+		select {
+		case frame := <-wsm.DataCh:
+			frames = append(frames, frame)
+		case <-time.After(3 * time.Second):
+			t.Fatalf("timed out at frame %d", i)
+		}
+	}
+	for i, frame := range frames {
+		if frame.ReceivedAt.IsZero() {
+			t.Fatal("frame receipt time is zero")
+		}
+		wantType := websocket.MessageText
+		if i%2 != 0 {
+			wantType = websocket.MessageBinary
+		}
+		if frame.Type != wantType {
+			t.Fatalf("frame %d type = %v, want %v", i, frame.Type, wantType)
+		}
+		want := fmt.Sprintf("frame-%d", i)
+		if string(frame.Data) != want {
+			t.Fatalf("frame %d = %s, want %s", i, frame.Data, want)
+		}
 	}
 }
 

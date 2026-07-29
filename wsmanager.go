@@ -19,8 +19,6 @@ import (
 
 	"github.com/dustinxie/lockfree"
 
-	json "github.com/goccy/go-json"
-
 	pp "github.com/wwnbb/pprint"
 	"github.com/wwnbb/wsmanager/bpool"
 	"github.com/wwnbb/wsmanager/states"
@@ -36,6 +34,14 @@ type WSConnection struct {
 
 	writeMu sync.Mutex
 	pingMu  sync.Mutex
+}
+
+// ReceivedFrame is one complete WebSocket message. ReceivedAt is captured
+// immediately after the message reader reaches EOF and before delivery.
+type ReceivedFrame struct {
+	Type       websocket.MessageType
+	Data       []byte
+	ReceivedAt time.Time
 }
 
 func (c *WSConnection) GetConn() *websocket.Conn {
@@ -85,7 +91,9 @@ type WSManager struct {
 	Conn      *WSConnection
 	url       string
 
-	DataCh        chan json.RawMessage
+	// DataCh preserves frame order and blocks the reader when its buffer is full.
+	// Keep draining it during shutdown until Wait returns.
+	DataCh        chan ReceivedFrame
 	DisconnectSig chan struct{}
 	disconnectWg  sync.WaitGroup
 
@@ -94,6 +102,12 @@ type WSManager struct {
 	connectMu  sync.Mutex
 
 	Pinger Pinger
+}
+
+// Wait blocks until the current connection's reader and pinger have stopped.
+// The caller must continue draining DataCh while waiting.
+func (m *WSManager) Wait() {
+	m.disconnectWg.Wait()
 }
 
 func (m *WSManager) getConn() *WSConnection {
@@ -221,7 +235,7 @@ func NewWSManager(url string, parentCtx context.Context, DataChSize ...int) *WSM
 		Logger:     slog.Default(),
 		ctxCancel:  cancel,
 
-		DataCh:        make(chan json.RawMessage, chSz),
+		DataCh:        make(chan ReceivedFrame, chSz),
 		DisconnectSig: make(chan struct{}, 1),
 		Pinger:        NewDefaultPinger(), // Use default pinger
 	}
@@ -323,12 +337,11 @@ func (m *WSManager) Connect() error {
 		return err
 	}
 
-	m.disconnectWg.Add(1)
+	m.disconnectWg.Add(2)
 	go func() {
 		defer m.disconnectWg.Done()
 		m.readMessages()
 	}()
-	m.disconnectWg.Add(1)
 	go func() {
 		defer m.disconnectWg.Done()
 		onError := func() {
@@ -420,7 +433,7 @@ func (m *WSManager) readMessages() {
 					}
 				}()
 
-				_, reader, err := conn.Conn.Reader(conn.ctx)
+				messageType, reader, err := conn.Conn.Reader(conn.ctx)
 				if err != nil {
 					m.handleReaderError(err)
 					return
@@ -440,30 +453,26 @@ func (m *WSManager) readMessages() {
 					m.SetDisconnectedFromConnected()
 					return
 				}
+				receivedAt := time.Now()
+				frame := ReceivedFrame{
+					Type:       messageType,
+					Data:       append([]byte(nil), b.Bytes()...),
+					ReceivedAt: receivedAt,
+				}
 
-				var data json.RawMessage
-				if err := json.Unmarshal(b.Bytes(), &data); err != nil {
-					m.Logger.Error("failed to unmarshal message", "error", err)
+				if m.Pinger != nil && m.Pinger.HandleMessage(m.ctx, conn, frame, m.Logger) {
 					return
 				}
 
-				if m.Pinger != nil && m.Pinger.HandleMessage(m.ctx, conn, data, m.Logger) {
-					return
-				}
-
-				select {
-				case m.DataCh <- data:
-					m.Logger.Debug("received message", "data", pp.PrettyFormat(data))
-				default:
-					m.Logger.Error("message buffer full, dropping message")
-				}
+				m.DataCh <- frame
+				m.Logger.Debug("received message", "type", frame.Type, "data", pp.PrettyFormat(frame.Data))
 			}()
 		}
 	}
 }
 
+// Close stops the current connection. DataCh remains open for reconnects.
 func (m *WSManager) Close() error {
-	fmt.Println("Closing WSManager")
 	m.SetDisconnectedFromConnected()
 	m.SetDisconnectedFromConnecting()
 
