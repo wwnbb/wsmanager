@@ -42,7 +42,7 @@ func NewDefaultPinger() *DefaultPinger {
 }
 
 func (p *DefaultPinger) Ping(ctx context.Context, conn *WSConnection, reqIdFunc func(topic string) string) error {
-	payload := map[string]interface{}{
+	payload := map[string]any{
 		"req_id": reqIdFunc("ping"),
 		"op":     "ping",
 	}

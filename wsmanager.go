@@ -48,18 +48,6 @@ func (c *WSConnection) GetConn() *websocket.Conn {
 	return c.Conn
 }
 
-func (c *WSConnection) getLastPing() time.Time {
-	c.pingMu.Lock()
-	defer c.pingMu.Unlock()
-	return c.lastPing
-}
-
-func (c *WSConnection) setLastPing(t time.Time) {
-	c.pingMu.Lock()
-	defer c.pingMu.Unlock()
-	c.lastPing = t
-}
-
 func (c *WSConnection) WriteJSON(v any) error {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
@@ -392,7 +380,6 @@ func (m *WSManager) handleReaderError(err error) {
 
 	m.Logger.Error("failed to get reader", "error", err, "conn_state", m.GetConnState().String())
 	m.SetDisconnectedFromConnected()
-	return
 
 }
 
@@ -481,7 +468,7 @@ func (m *WSManager) Close() error {
 	return nil
 }
 
-func (m *WSManager) SendRequest(v interface{}) error {
+func (m *WSManager) SendRequest(v any) error {
 	conn := m.getConn()
 	if state := m.GetConnState(); state != states.StateConnected {
 		return fmt.Errorf("websocket not connected, current state: %s", state.String())
