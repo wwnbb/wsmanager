@@ -17,7 +17,7 @@ import (
 	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
 
-	"github.com/dustinxie/lockfree"
+	"github.com/jeremiah-masters/dlht"
 
 	pp "github.com/wwnbb/pprint"
 	"github.com/wwnbb/wsmanager/bpool"
@@ -97,7 +97,7 @@ type WSManager struct {
 	DisconnectSig chan struct{}
 	disconnectWg  sync.WaitGroup
 
-	requestIds lockfree.HashMap
+	requestIds *dlht.Map[string, int]
 	connMu     sync.RWMutex
 	connectMu  sync.Mutex
 
@@ -151,12 +151,12 @@ func (m *WSManager) SetPinger(pinger Pinger) {
 
 func (m *WSManager) GetReqId(topic string) string {
 	if n, exist := m.requestIds.Get(topic); exist {
-		id := n.(int) + 1
-		m.requestIds.Set(topic, id)
+		id := n + 1
+		m.requestIds.Put(topic, id)
 		return fmt.Sprintf("%s_%d", topic, id)
 	}
 
-	m.requestIds.Set(topic, 1)
+	m.requestIds.Insert(topic, 1)
 	return fmt.Sprintf("%s_%d", topic, 1)
 }
 
@@ -227,7 +227,7 @@ func NewWSManager(url string, parentCtx context.Context, DataChSize ...int) *WSM
 		chSz = DataChSize[0]
 	}
 	wsm := &WSManager{
-		requestIds: lockfree.NewHashMap(),
+		requestIds: dlht.New[string, int](dlht.Options{}),
 		url:        url,
 		connState:  states.StateNew,
 		parentCtx:  parentCtx,
