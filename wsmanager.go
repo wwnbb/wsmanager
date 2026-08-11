@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
 	"strings"
@@ -15,7 +14,6 @@ import (
 	"log/slog"
 
 	"github.com/coder/websocket"
-	"github.com/coder/websocket/wsjson"
 
 	"github.com/jeremiah-masters/dlht"
 
@@ -24,49 +22,9 @@ import (
 	"github.com/wwnbb/wsmanager/states"
 )
 
-type WSConnection struct {
-	*websocket.Conn
-
-	ctx    context.Context
-	cancel context.CancelFunc
-
-	lastPing time.Time
-
-	writeMu sync.Mutex
-	pingMu  sync.Mutex
-}
-
-// ReceivedFrame is one complete WebSocket message. ReceivedAt is captured
-// immediately after the message reader reaches EOF and before delivery.
-type ReceivedFrame struct {
-	Type       websocket.MessageType
-	Data       []byte
-	ReceivedAt time.Time
-}
-
-func (c *WSConnection) GetConn() *websocket.Conn {
-	return c.Conn
-}
-
-func (c *WSConnection) WriteJSON(v any) error {
-	c.writeMu.Lock()
-	defer c.writeMu.Unlock()
-
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
-	defer cancel()
-
-	return wsjson.Write(ctx, c.Conn, v)
-}
-
-func (c *WSConnection) WritePing(ctx context.Context) error {
-	c.writeMu.Lock()
-	defer c.writeMu.Unlock()
-	return c.Conn.Ping(ctx)
-}
-
-func (c *WSManager) GetConnState() states.ConnectionState {
-	return states.ConnectionState(atomic.LoadInt32((*int32)(&c.connState)))
-}
+// DefaultReadLimit is the default maximum size in bytes of a complete inbound
+// WebSocket message (4 MiB).
+const DefaultReadLimit int64 = 4 << 20
 
 type WSManager struct {
 	Logger *slog.Logger
@@ -74,26 +32,34 @@ type WSManager struct {
 	parentCtx context.Context
 	ctx       context.Context
 	ctxCancel context.CancelFunc
+	ctxMu     sync.RWMutex // guards ctx / ctxCancel
 
 	connState states.ConnectionState
 	Conn      *WSConnection
 	url       string
 
-	// DataCh preserves frame order and blocks the reader when its buffer is full.
-	// Keep draining it during shutdown until Wait returns.
+	// DataCh preserves frame order for delivered frames and blocks the reader when
+	// its buffer is full. Queued frames remain readable after Close. An in-flight
+	// frame blocked on send is dropped when the connection context is canceled;
+	// callers need not drain DataCh for Wait to return.
 	DataCh        chan ReceivedFrame
 	DisconnectSig chan struct{}
 	disconnectWg  sync.WaitGroup
 
 	requestIds *dlht.Map[string, int]
+	reqIDMu    sync.Mutex
 	connMu     sync.RWMutex
 	connectMu  sync.Mutex
+	cfgMu      sync.RWMutex
+	readLimit  int64 // complete inbound message limit; guarded by cfgMu
+
+	nextConnID atomic.Uint64
 
 	Pinger Pinger
 }
 
 // Wait blocks until the current connection's reader and pinger have stopped.
-// The caller must continue draining DataCh while waiting.
+// Queued DataCh frames remain readable; draining is not required for Wait to return.
 func (m *WSManager) Wait() {
 	m.disconnectWg.Wait()
 }
@@ -107,37 +73,96 @@ func (m *WSManager) getConn() *WSConnection {
 func (m *WSManager) setConn(conn *WSConnection) {
 	m.connMu.Lock()
 	defer m.connMu.Unlock()
+	if conn != nil {
+		conn.id = m.nextConnID.Add(1)
+	}
 	m.Conn = conn
 }
 
-func (m *WSManager) closeConn(closeCode websocket.StatusCode, reason string) {
-	conn := m.getConn()
+func (m *WSManager) isCurrentConn(conn *WSConnection) bool {
 	if conn == nil {
-		return
+		return false
 	}
-
-	m.setConn(nil)
-	if conn.cancel != nil {
-		conn.cancel()
-	}
-	if conn.Conn != nil {
-		_ = conn.Conn.Close(closeCode, reason)
-		conn.Conn.CloseNow()
-	}
+	m.connMu.RLock()
+	defer m.connMu.RUnlock()
+	return m.Conn != nil && m.Conn.id == conn.id
 }
 
-func (m *WSManager) teardownConnection(closeCode websocket.StatusCode, reason string) {
-	if m.Pinger != nil {
-		m.Pinger.Stop()
+func (m *WSManager) closeConn(closeCode websocket.StatusCode, reason string) {
+	m.connMu.Lock()
+	conn := m.Conn
+	m.Conn = nil
+	m.connMu.Unlock()
+
+	closeDetachedConn(conn, closeCode, reason, true)
+}
+
+// closeConnIfCurrent detaches and closes conn only when it is still the active connection.
+func (m *WSManager) closeConnIfCurrent(conn *WSConnection, closeCode websocket.StatusCode, reason string) bool {
+	if conn == nil {
+		return false
 	}
-	m.closeConn(closeCode, reason)
+	m.connMu.Lock()
+	if m.Conn == nil || m.Conn.id != conn.id {
+		m.connMu.Unlock()
+		return false
+	}
+	current := m.Conn
+	m.Conn = nil
+	m.connMu.Unlock()
+
+	closeDetachedConn(current, closeCode, reason, true)
+	return true
 }
 
 func (m *WSManager) SetPinger(pinger Pinger) {
+	m.cfgMu.Lock()
+	defer m.cfgMu.Unlock()
 	m.Pinger = pinger
 }
 
+func (m *WSManager) getPinger() Pinger {
+	m.cfgMu.RLock()
+	defer m.cfgMu.RUnlock()
+	return m.Pinger
+}
+
+// SetReadLimit sets the maximum complete inbound WebSocket message size in bytes.
+// limit must be positive. The value is stored for future connections and applied
+// immediately to the current connection when one exists.
+//
+// Lock ordering: cfgMu then connMu (never inverted) so Connect cannot install a
+// connection with a stale limit while a concurrent SetReadLimit runs.
+func (m *WSManager) SetReadLimit(limit int64) error {
+	if limit <= 0 {
+		return fmt.Errorf("invalid read limit: %d (must be positive)", limit)
+	}
+
+	m.cfgMu.Lock()
+	m.readLimit = limit
+	m.connMu.RLock()
+	conn := m.Conn
+	m.connMu.RUnlock()
+	if conn != nil && conn.Conn != nil {
+		conn.Conn.SetReadLimit(limit)
+	}
+	m.cfgMu.Unlock()
+	return nil
+}
+
+// applyReadLimitLocked applies the current read limit to conn.
+// Caller must hold cfgMu (read or write).
+func (m *WSManager) applyReadLimitLocked(conn *WSConnection) {
+	if conn == nil || conn.Conn == nil {
+		return
+	}
+	conn.Conn.SetReadLimit(m.readLimit)
+}
+
 func (m *WSManager) GetReqId(topic string) string {
+	m.reqIDMu.Lock()
+	defer m.reqIDMu.Unlock()
+
 	if n, exist := m.requestIds.Get(topic); exist {
 		id := n + 1
 		m.requestIds.Put(topic, id)
@@ -183,7 +208,51 @@ func (m *WSManager) setDisconnected(from states.ConnectionState, reason string) 
 		return false
 	}
 
-	m.teardownConnection(websocket.StatusNormalClosure, reason)
+	m.closeConn(websocket.StatusNormalClosure, reason)
+	m.notifyDisconnect()
+	return true
+}
+
+// failConnection disconnects only when conn is still the active connection and
+// the manager is Connected. Stale failures from older connections are ignored.
+// Always stops the snapshotted pinger (reader/send paths).
+func (m *WSManager) failConnection(conn *WSConnection, reason string) bool {
+	return m.failConnectionLocked(conn, reason, true)
+}
+
+// failConnectionFromPinger is the generation-scoped failure path for callbacks
+// originating inside Pinger.Start (onError or a recovered panic).
+//
+// It transitions state, detaches the connection, cancels conn.ctx, closes the
+// websocket, and signals DisconnectSig — but does not call Pinger.Stop.
+// onError is the terminal callback for that Start invocation; Start must return
+// after invoking it. Calling Stop here would deadlock if Stop waits for Start.
+func (m *WSManager) failConnectionFromPinger(conn *WSConnection, reason string) bool {
+	return m.failConnectionLocked(conn, reason, false)
+}
+
+// failConnectionLocked performs generation-aware Connected→Disconnected teardown.
+// Manager locks are released before cancel/Close/log/notify.
+func (m *WSManager) failConnectionLocked(conn *WSConnection, reason string, stopPinger bool) bool {
+	if conn == nil {
+		return false
+	}
+
+	m.connMu.Lock()
+	if m.Conn == nil || m.Conn.id != conn.id {
+		m.connMu.Unlock()
+		return false
+	}
+	if !changeState(states.StateConnected, states.StateDisconnected, m) {
+		m.connMu.Unlock()
+		return false
+	}
+	current := m.Conn
+	m.Conn = nil
+	m.connMu.Unlock()
+
+	m.Logger.Debug("SetDisconnected", "from", states.StateConnected, "to", states.StateDisconnected, "reason", reason)
+	closeDetachedConn(current, websocket.StatusNormalClosure, reason, stopPinger)
 	m.notifyDisconnect()
 	return true
 }
@@ -208,45 +277,72 @@ func (m *WSManager) notifyDisconnect() {
 	}
 }
 
-func NewWSManager(url string, parentCtx context.Context, DataChSize ...int) *WSManager {
+// NewWSManager creates a manager. nil logger becomes slog.Default().
+// dataChSize is optional; default buffer is 1000.
+func NewWSManager(url string, parentCtx context.Context, logger *slog.Logger, dataChSize ...int) *WSManager {
 	ctx, cancel := context.WithCancel(parentCtx)
-	var chSz int = 1000
-	if len(DataChSize) > 0 && DataChSize[0] > 0 {
-		chSz = DataChSize[0]
+	chSz := 1000
+	if len(dataChSize) > 0 && dataChSize[0] > 0 {
+		chSz = dataChSize[0]
 	}
-	wsm := &WSManager{
-		requestIds: dlht.New[string, int](dlht.Options{}),
-		url:        url,
-		connState:  states.StateNew,
-		parentCtx:  parentCtx,
-		ctx:        ctx,
-		Logger:     slog.Default(),
-		ctxCancel:  cancel,
-
+	if logger == nil {
+		logger = slog.Default()
+	}
+	return &WSManager{
+		requestIds:    dlht.New[string, int](dlht.Options{}),
+		url:           url,
+		connState:     states.StateNew,
+		parentCtx:     parentCtx,
+		ctx:           ctx,
+		Logger:        logger,
+		ctxCancel:     cancel,
+		readLimit:     DefaultReadLimit,
 		DataCh:        make(chan ReceivedFrame, chSz),
 		DisconnectSig: make(chan struct{}, 1),
-		Pinger:        NewDefaultPinger(), // Use default pinger
+		Pinger:        NewDefaultPinger(),
 	}
-	return wsm
 }
 
-func (m *WSManager) SetLogger(Logger *slog.Logger) {
-	m.Logger = Logger
+// SetLogger replaces the logger. nil becomes slog.Default().
+// Intended before Connect / for tests; not synchronized with in-flight logs.
+func (m *WSManager) SetLogger(logger *slog.Logger) {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	m.Logger = logger
 }
 
-func (m *WSManager) SetProductionLogger() {
-	m.SetLogger(slog.New(slog.NewTextHandler(io.Discard, nil)))
+func (m *WSManager) managerCtx() context.Context {
+	m.ctxMu.RLock()
+	defer m.ctxMu.RUnlock()
+	return m.ctx
+}
+
+func (m *WSManager) cancelManagerCtx() {
+	m.ctxMu.RLock()
+	cancel := m.ctxCancel
+	m.ctxMu.RUnlock()
+	if cancel != nil {
+		cancel()
+	}
 }
 
 func (m *WSManager) refreshContext() error {
 	m.disconnectWg.Wait()
+
+	m.ctxMu.Lock()
+	defer m.ctxMu.Unlock()
+
 	select {
 	case <-m.parentCtx.Done():
 		return fmt.Errorf("parent context done:  %w", m.parentCtx.Err())
+	default:
+	}
+
+	select {
 	case <-m.ctx.Done():
 		m.ctx, m.ctxCancel = context.WithCancel(m.parentCtx)
 	default:
-		return nil
 	}
 	return nil
 }
@@ -272,17 +368,21 @@ func (m *WSManager) Connect() error {
 
 	err := m.refreshContext()
 	if err != nil {
+		m.SetDisconnectedFromConnecting()
 		return fmt.Errorf("failed to refresh context: %w", err)
 	}
 
+	// Stable snapshot for dial + conn lifetime (ctxMu-protected).
+	mgrCtx := m.managerCtx()
+
 	m.Logger.Info("Connecting to websocket", "url", m.url)
 
-	conn := m.getConn()
-	if conn != nil {
-		m.teardownConnection(websocket.StatusNormalClosure, "replacing connection")
+	existing := m.getConn()
+	if existing != nil {
+		m.closeConn(websocket.StatusNormalClosure, "replacing connection")
 	}
 
-	dialCtx, dialCancel := context.WithTimeout(m.ctx, 15*time.Second)
+	dialCtx, dialCancel := context.WithTimeout(mgrCtx, 15*time.Second)
 	defer dialCancel()
 
 	opts := &websocket.DialOptions{
@@ -302,48 +402,71 @@ func (m *WSManager) Connect() error {
 		return fmt.Errorf("websocket dial failed: %w", err)
 	}
 
-	connCtx, cancel := context.WithCancel(m.ctx)
+	connCtx, cancel := context.WithCancel(mgrCtx)
+	pinger := m.getPinger()
 
-	m.setConn(&WSConnection{
+	conn := &WSConnection{
 		Conn:     wsConn,
 		ctx:      connCtx,
 		cancel:   cancel,
 		lastPing: time.Now(),
 		writeMu:  sync.Mutex{},
-	})
-	conn = m.getConn()
-	conn.Conn.SetReadLimit(-1)
+		pinger:   pinger,
+	}
+	m.setConn(conn)
+	// Apply limit under cfgMu so a concurrent SetReadLimit cannot race to a stale value.
+	m.cfgMu.RLock()
+	m.applyReadLimitLocked(conn)
+	m.cfgMu.RUnlock()
 
-	defer func() {
-		if err != nil && conn != nil {
-			m.teardownConnection(websocket.StatusInternalError, "connect failed")
-		}
-	}()
+	// Register workers once before Connected is visible; never Add after Start.
+	workers := 1
+	if pinger != nil {
+		workers++
+	}
+	m.disconnectWg.Add(workers)
 
 	if !m.SetConnected() {
-		err = fmt.Errorf("state transition failed from %s to %s", m.GetConnState(), states.StateConnected)
-		return err
+		m.disconnectWg.Add(-workers)
+		state := m.GetConnState()
+		// Roll back Connecting and drop this attempt without touching a newer conn.
+		if !m.SetDisconnectedFromConnecting() {
+			m.closeConnIfCurrent(conn, websocket.StatusInternalError, "connect failed")
+		}
+		return fmt.Errorf("state transition failed from %s to %s", state, states.StateConnected)
 	}
 
-	m.disconnectWg.Add(2)
 	go func() {
 		defer m.disconnectWg.Done()
-		m.readMessages()
+		m.readMessages(conn)
 	}()
-	go func() {
-		defer m.disconnectWg.Done()
-		onError := func() {
-			m.SetDisconnectedFromConnected()
-		}
-		m.Pinger.Start(conn.ctx, conn, m.Logger, m.GetReqId, onError)
-	}()
+
+	if pinger != nil {
+		logger := m.Logger
+		go func() {
+			defer m.disconnectWg.Done()
+			defer func() {
+				if r := recover(); r != nil {
+					m.Logger.Error("recovered from panic in Pinger.Start", "panic", r)
+					// Same no-Stop path as onError: Start is unwinding through recover.
+					m.failConnectionFromPinger(conn, "connection lost")
+				}
+			}()
+			// onError is terminal for this Start: do not Stop from that path.
+			onError := func() {
+				m.failConnectionFromPinger(conn, "connection lost")
+			}
+			pinger.Start(conn.ctx, conn, logger, m.GetReqId, onError)
+		}()
+	}
 
 	return nil
 }
 
-func (m *WSManager) handleReaderError(err error) {
-	if m.GetConnState() != states.StateConnected {
-		m.Logger.Debug("reader error after disconnect", "error", err)
+func (m *WSManager) handleReaderError(conn *WSConnection, err error) {
+	logger := m.Logger
+	if !m.isCurrentConn(conn) || m.GetConnState() != states.StateConnected {
+		logger.Debug("reader error after disconnect", "error", err)
 		return
 	}
 
@@ -351,78 +474,77 @@ func (m *WSManager) handleReaderError(err error) {
 	if errors.As(err, &closeErr) {
 		switch closeErr.Code {
 		case websocket.StatusNormalClosure, websocket.StatusGoingAway:
-			m.Logger.Warn("connection closed", "code", closeErr.Code, "reason", closeErr.Reason)
+			logger.Warn("connection closed", "code", closeErr.Code, "reason", closeErr.Reason)
 		case websocket.StatusAbnormalClosure:
-			m.Logger.Error("abnormal connection closure", "code", closeErr.Code, "reason", closeErr.Reason)
+			logger.Error("abnormal connection closure", "code", closeErr.Code, "reason", closeErr.Reason)
 		default:
-			m.Logger.Error("connection closed with error", "code", closeErr.Code, "reason", closeErr.Reason)
+			logger.Error("connection closed with error", "code", closeErr.Code, "reason", closeErr.Reason)
 		}
-		m.SetDisconnectedFromConnected()
+		m.failConnection(conn, "connection lost")
 		return
 	}
 
 	if errors.Is(err, net.ErrClosed) {
-		m.Logger.Warn("connection already closed")
-		m.SetDisconnectedFromConnected()
+		logger.Warn("connection already closed")
+		m.failConnection(conn, "connection lost")
 		return
 	}
 
 	if errors.Is(err, context.DeadlineExceeded) {
-		m.Logger.Warn("read context deadline exceeded")
-		m.SetDisconnectedFromConnected()
+		logger.Warn("read context deadline exceeded")
+		m.failConnection(conn, "connection lost")
 		return
 	}
 	if errors.Is(err, context.Canceled) {
-		m.Logger.Warn("read context canceled")
-		m.SetDisconnectedFromConnected()
+		logger.Warn("read context canceled")
+		m.failConnection(conn, "connection lost")
 		return
 	}
 
-	m.Logger.Error("failed to get reader", "error", err, "conn_state", m.GetConnState().String())
-	m.SetDisconnectedFromConnected()
-
+	logger.Error("failed to get reader", "error", err, "conn_state", m.GetConnState().String())
+	m.failConnection(conn, "connection lost")
 }
 
-func (m *WSManager) readMessages() {
+func (m *WSManager) readMessages(conn *WSConnection) {
+	logger := m.Logger
 	defer func() {
 		if r := recover(); r != nil {
-			m.Logger.Error("recovered from panic in readMessages", "panic", r)
-			m.SetDisconnectedFromConnected()
+			logger.Error("recovered from panic in readMessages", "panic", r)
+			m.failConnection(conn, "connection lost")
 			return
 		}
 	}()
-	conn := m.getConn()
 
 	if conn == nil {
-		m.Logger.Error("readMessages: connection is nil, exiting")
+		logger.Error("readMessages: connection is nil, exiting")
 		return
 	}
 
-	m.Logger.Debug("Starting ReadMessages")
-	defer m.Logger.Debug("Exiting ReadMessages")
+	logger.Debug("Starting ReadMessages")
+	defer logger.Debug("Exiting ReadMessages")
 
 	for {
 		select {
 		case <-conn.ctx.Done():
-			m.Logger.Debug("Read messages context done, exiting")
+			logger.Debug("Read messages context done, exiting")
 			return
 		default:
-			if m.GetConnState() != states.StateConnected {
+			if !m.isCurrentConn(conn) || m.GetConnState() != states.StateConnected {
 				return
 			}
 
 			func() {
 				defer func() {
 					if r := recover(); r != nil {
-						m.Logger.Error("recovered from panic in ReadMessage", "panic", r)
-						m.SetDisconnectedFromConnected()
+						logger.Error("recovered from panic in ReadMessage", "panic", r)
+						m.failConnection(conn, "connection lost")
 						return
 					}
 				}()
 
 				messageType, reader, err := conn.Conn.Reader(conn.ctx)
 				if err != nil {
-					m.handleReaderError(err)
+					m.handleReaderError(conn, err)
 					return
 				}
 
@@ -432,12 +554,12 @@ func (m *WSManager) readMessages() {
 				_, err = b.ReadFrom(reader)
 				if err != nil {
 					if strings.Contains(err.Error(), "context deadline exceeded") {
-						m.Logger.Error("read timeout")
-						m.SetDisconnectedFromConnected()
+						logger.Error("read timeout")
+						m.failConnection(conn, "connection lost")
 						return
 					}
-					m.Logger.Error("failed to read message", "error", err)
-					m.SetDisconnectedFromConnected()
+					logger.Error("failed to read message", "error", err)
+					m.failConnection(conn, "connection lost")
 					return
 				}
 				receivedAt := time.Now()
@@ -447,12 +569,20 @@ func (m *WSManager) readMessages() {
 					ReceivedAt: receivedAt,
 				}
 
-				if m.Pinger != nil && m.Pinger.HandleMessage(m.ctx, conn, frame, m.Logger) {
+				if conn.pinger != nil && conn.pinger.HandleMessage(conn.ctx, conn, frame, logger) {
 					return
 				}
 
-				m.DataCh <- frame
-				m.Logger.Debug("received message", "type", frame.Type, "data", pp.PrettyFormat(frame.Data))
+				// Cancellation wins over a blocked DataCh send: drop this in-flight frame.
+				select {
+				case m.DataCh <- frame:
+					if logger.Enabled(context.Background(), slog.LevelDebug) {
+						logger.Debug("received message", "type", frame.Type, "data", pp.PrettyFormat(frame.Data))
+					}
+				case <-conn.ctx.Done():
+					logger.Debug("dropping in-flight frame on connection cancel")
+					return
+				}
 			}()
 		}
 	}
@@ -463,17 +593,17 @@ func (m *WSManager) Close() error {
 	m.SetDisconnectedFromConnected()
 	m.SetDisconnectedFromConnecting()
 
-	m.ctxCancel()
-	m.teardownConnection(websocket.StatusNormalClosure, "done")
+	m.cancelManagerCtx()
+	m.closeConn(websocket.StatusNormalClosure, "done")
 	return nil
 }
 
 func (m *WSManager) SendRequest(v any) error {
+	// Coherent snapshot: capture the connection pointer once, then validate state.
 	conn := m.getConn()
 	if state := m.GetConnState(); state != states.StateConnected {
 		return fmt.Errorf("websocket not connected, current state: %s", state.String())
 	}
-
 	if conn == nil {
 		return fmt.Errorf("websocket connection is nil")
 	}
@@ -481,10 +611,14 @@ func (m *WSManager) SendRequest(v any) error {
 	err := conn.WriteJSON(v)
 	if err != nil {
 		m.Logger.Error("failed to send message", "error", err)
-		m.SetDisconnectedFromConnected()
+		// Only tear down this connection generation; never a newer one.
+		m.failConnection(conn, "connection lost")
 		return fmt.Errorf("failed to send message: %w", err)
-	} else {
-		m.Logger.Debug("sent message", "data", pp.PrettyFormat(v))
+	}
+
+	logger := m.Logger
+	if logger.Enabled(context.Background(), slog.LevelDebug) {
+		logger.Debug("sent message", "data", pp.PrettyFormat(v))
 	}
 	return nil
 }

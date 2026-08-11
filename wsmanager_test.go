@@ -24,7 +24,7 @@ func TestNewWSManager(t *testing.T) {
 	ctx := context.Background()
 	url := "wss://example.com/ws"
 
-	wsm := wsmanager.NewWSManager(url, ctx)
+	wsm := wsmanager.NewWSManager(url, ctx, nil)
 
 	if wsm == nil {
 		t.Fatal("NewWSManager returned nil")
@@ -45,7 +45,7 @@ func TestNewWSManager(t *testing.T) {
 
 func TestSetLogger(t *testing.T) {
 	ctx := context.Background()
-	wsm := wsmanager.NewWSManager("wss://example.com/ws", ctx)
+	wsm := wsmanager.NewWSManager("wss://example.com/ws", ctx, nil)
 
 	customLogger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	wsm.SetLogger(customLogger)
@@ -57,7 +57,7 @@ func TestSetLogger(t *testing.T) {
 
 func TestStateTransitions(t *testing.T) {
 	ctx := context.Background()
-	wsm := wsmanager.NewWSManager("wss://example.com/ws", ctx)
+	wsm := wsmanager.NewWSManager("wss://example.com/ws", ctx, nil)
 
 	// New -> Connecting
 	if !wsm.SetConnecting() {
@@ -94,7 +94,7 @@ func TestStateTransitions(t *testing.T) {
 
 func TestInvalidStateTransitions(t *testing.T) {
 	ctx := context.Background()
-	wsm := wsmanager.NewWSManager("wss://example.com/ws", ctx)
+	wsm := wsmanager.NewWSManager("wss://example.com/ws", ctx, nil)
 
 	wsm.SetConnecting()
 	wsm.SetConnected()
@@ -114,7 +114,7 @@ func TestInvalidStateTransitions(t *testing.T) {
 
 func TestSendRequestWithoutConnection(t *testing.T) {
 	ctx := context.Background()
-	wsm := wsmanager.NewWSManager("wss://example.com/ws", ctx)
+	wsm := wsmanager.NewWSManager("wss://example.com/ws", ctx, nil)
 
 	msg := map[string]interface{}{
 		"op": "test",
@@ -132,7 +132,7 @@ func TestSendRequestWithoutConnection(t *testing.T) {
 
 func TestCloseWithoutConnection(t *testing.T) {
 	ctx := context.Background()
-	wsm := wsmanager.NewWSManager("wss://example.com/ws", ctx)
+	wsm := wsmanager.NewWSManager("wss://example.com/ws", ctx, nil)
 
 	err := wsm.Close()
 	if err != nil {
@@ -144,7 +144,7 @@ func TestConnectWithCanceledContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	wsm := wsmanager.NewWSManager("wss://example.com/ws", ctx)
+	wsm := wsmanager.NewWSManager("wss://example.com/ws", ctx, nil)
 
 	err := wsm.Connect()
 	if err == nil {
@@ -154,8 +154,7 @@ func TestConnectWithCanceledContext(t *testing.T) {
 
 func TestConnectInvalidURL(t *testing.T) {
 	ctx := context.Background()
-	wsm := wsmanager.NewWSManager("invalid://url", ctx)
-	wsm.SetLogger(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})))
+	wsm := wsmanager.NewWSManager("invalid://url", ctx, slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})))
 
 	err := wsm.Connect()
 	if err == nil {
@@ -165,7 +164,7 @@ func TestConnectInvalidURL(t *testing.T) {
 
 func TestConcurrentStateAccess(t *testing.T) {
 	ctx := context.Background()
-	wsm := wsmanager.NewWSManager("wss://example.com/ws", ctx)
+	wsm := wsmanager.NewWSManager("wss://example.com/ws", ctx, nil)
 
 	var wg sync.WaitGroup
 	iterations := 100
@@ -191,7 +190,7 @@ func TestConcurrentStateAccess(t *testing.T) {
 
 func TestDataChannelCapacity(t *testing.T) {
 	ctx := context.Background()
-	wsm := wsmanager.NewWSManager("wss://example.com/ws", ctx)
+	wsm := wsmanager.NewWSManager("wss://example.com/ws", ctx, nil)
 
 	if cap(wsm.DataCh) != 1000 {
 		t.Errorf("Expected DataCh capacity of 1000, got %d", cap(wsm.DataCh))
@@ -285,8 +284,7 @@ func TestConnectToMockServer(t *testing.T) {
 
 	url := "ws" + strings.TrimPrefix(server.URL, "http")
 	ctx := context.Background()
-	wsm := wsmanager.NewWSManager(url, ctx)
-	wsm.SetLogger(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})))
+	wsm := wsmanager.NewWSManager(url, ctx, slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})))
 
 	err := wsm.Connect()
 	if err != nil {
@@ -321,8 +319,7 @@ func TestDisconnectStopsPingerAndSignalsOnce(t *testing.T) {
 
 	url := "ws" + strings.TrimPrefix(server.URL, "http")
 	ctx := context.Background()
-	wsm := wsmanager.NewWSManager(url, ctx)
-	wsm.SetLogger(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})))
+	wsm := wsmanager.NewWSManager(url, ctx, slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})))
 
 	pinger := newPersistentFailingPinger()
 	wsm.SetPinger(pinger)
@@ -345,14 +342,27 @@ func TestDisconnectStopsPingerAndSignalsOnce(t *testing.T) {
 	default:
 	}
 
+	// Pinger-originated onError must not call Stop (would deadlock if Stop waited on Start).
+	// Start exits via conn.ctx cancel instead.
+	waitDone := make(chan struct{})
+	go func() {
+		wsm.Wait()
+		close(waitDone)
+	}()
+	select {
+	case <-waitDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Wait did not return after pinger onError")
+	}
+
 	if wsm.GetConnState() != states.StateDisconnected {
 		t.Fatalf("expected disconnected state, got %v", wsm.GetConnState())
 	}
-	if pinger.stopCalls.Load() == 0 {
-		t.Fatal("expected pinger to be stopped")
+	if pinger.stopCalls.Load() != 0 {
+		t.Fatalf("Stop called %d times on pinger onError path, want 0", pinger.stopCalls.Load())
 	}
 	if pinger.pingCalls.Load() > 2 {
-		t.Fatalf("expected ping loop to stop quickly, got %d ping attempts", pinger.pingCalls.Load())
+		t.Fatalf("expected ping loop to stop quickly via ctx cancel, got %d ping attempts", pinger.pingCalls.Load())
 	}
 }
 
@@ -378,8 +388,7 @@ func TestReconnect(t *testing.T) {
 
 	url := "ws" + strings.TrimPrefix(server.URL, "http")
 	ctx := context.Background()
-	wsm := wsmanager.NewWSManager(url, ctx)
-	wsm.SetLogger(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})))
+	wsm := wsmanager.NewWSManager(url, ctx, slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})))
 
 	err := wsm.Connect()
 	if err != nil {
@@ -443,8 +452,7 @@ func TestReceiveMessages(t *testing.T) {
 
 	url := "ws" + strings.TrimPrefix(server.URL, "http")
 	ctx := context.Background()
-	wsm := wsmanager.NewWSManager(url, ctx)
-	wsm.SetLogger(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})))
+	wsm := wsmanager.NewWSManager(url, ctx, slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})))
 
 	err := wsm.Connect()
 	if err != nil {
@@ -474,8 +482,7 @@ func TestMultipleConcurrentConnects(t *testing.T) {
 
 	url := "ws" + strings.TrimPrefix(server.URL, "http")
 	ctx := context.Background()
-	wsm := wsmanager.NewWSManager(url, ctx)
-	wsm.SetLogger(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})))
+	wsm := wsmanager.NewWSManager(url, ctx, slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})))
 
 	var wg sync.WaitGroup
 	errors := make([]error, 3)
@@ -506,8 +513,7 @@ func TestMultipleConcurrentConnects(t *testing.T) {
 
 func TestConnectFromConnectingState(t *testing.T) {
 	ctx := context.Background()
-	wsm := wsmanager.NewWSManager("wss://example.com/ws", ctx)
-	wsm.SetLogger(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})))
+	wsm := wsmanager.NewWSManager("wss://example.com/ws", ctx, slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})))
 
 	wsm.SetConnecting()
 
@@ -529,8 +535,7 @@ func TestConnectFromConnectedState(t *testing.T) {
 
 	url := "ws" + strings.TrimPrefix(server.URL, "http")
 	ctx := context.Background()
-	wsm := wsmanager.NewWSManager(url, ctx)
-	wsm.SetLogger(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})))
+	wsm := wsmanager.NewWSManager(url, ctx, slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})))
 
 	err := wsm.Connect()
 	if err != nil {
@@ -548,7 +553,7 @@ func TestConnectFromConnectedState(t *testing.T) {
 
 func TestSendRequestNilConnection(t *testing.T) {
 	ctx := context.Background()
-	wsm := wsmanager.NewWSManager("wss://example.com/ws", ctx)
+	wsm := wsmanager.NewWSManager("wss://example.com/ws", ctx, nil)
 
 	wsm.SetConnecting()
 	wsm.SetConnected()
@@ -576,8 +581,7 @@ func TestServerClosesConnection(t *testing.T) {
 
 	url := "ws" + strings.TrimPrefix(server.URL, "http")
 	ctx := context.Background()
-	wsm := wsmanager.NewWSManager(url, ctx)
-	wsm.SetLogger(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})))
+	wsm := wsmanager.NewWSManager(url, ctx, slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})))
 
 	err := wsm.Connect()
 	if err != nil {
@@ -601,7 +605,9 @@ func TestServerClosesConnection(t *testing.T) {
 	}
 }
 
-func TestDataChannelDrainsBlockedFrameOnClose(t *testing.T) {
+// TestDataChannelDropsBlockedFrameOnClose: buffer=1, second frame blocks on DataCh send.
+// Close cancels conn ctx; in-flight blocked send is dropped. Wait must not require drain.
+func TestDataChannelDropsBlockedFrameOnClose(t *testing.T) {
 	server := mockWebSocketServer(t, func(conn *websocket.Conn) {
 		ctx := context.Background()
 		for i := 0; i < 2; i++ {
@@ -615,8 +621,7 @@ func TestDataChannelDrainsBlockedFrameOnClose(t *testing.T) {
 	defer server.Close()
 
 	url := "ws" + strings.TrimPrefix(server.URL, "http")
-	wsm := wsmanager.NewWSManager(url, context.Background(), 1)
-	wsm.SetLogger(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})))
+	wsm := wsmanager.NewWSManager(url, context.Background(), slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})), 1)
 	observer := &observingPinger{frames: make(chan struct{}, 2)}
 	wsm.SetPinger(observer)
 
@@ -638,21 +643,24 @@ func TestDataChannelDrainsBlockedFrameOnClose(t *testing.T) {
 		wsm.Wait()
 		close(done)
 	}()
-	for i := 0; i < 2; i++ {
-		select {
-		case frame := <-wsm.DataCh:
-			want := fmt.Sprintf(`{"id":%d}`, i)
-			if string(frame.Data) != want {
-				t.Fatalf("frame %d = %s, want %s", i, frame.Data, want)
-			}
-		case <-time.After(3 * time.Second):
-			t.Fatalf("timed out draining frame %d", i)
-		}
-	}
 	select {
 	case <-done:
 	case <-time.After(3 * time.Second):
-		t.Fatal("Wait did not return after DataCh was drained")
+		t.Fatal("Wait did not return without draining DataCh")
+	}
+	// Queued frame (buffer slot) remains readable; blocked in-flight frame was dropped.
+	select {
+	case frame := <-wsm.DataCh:
+		if string(frame.Data) != `{"id":0}` {
+			t.Fatalf("queued frame = %s, want {\"id\":0}", frame.Data)
+		}
+	default:
+		t.Fatal("expected first frame still queued on DataCh")
+	}
+	select {
+	case frame := <-wsm.DataCh:
+		t.Fatalf("unexpected extra frame after drop: %s", frame.Data)
+	default:
 	}
 }
 
@@ -674,7 +682,7 @@ func TestDataChannelPreservesFramesAndReceiptTime(t *testing.T) {
 	defer server.Close()
 
 	url := "ws" + strings.TrimPrefix(server.URL, "http")
-	wsm := wsmanager.NewWSManager(url, context.Background(), 1)
+	wsm := wsmanager.NewWSManager(url, context.Background(), nil, 1)
 	if err := wsm.Connect(); err != nil {
 		t.Fatal(err)
 	}
@@ -724,8 +732,7 @@ func TestConcurrentSendRequests(t *testing.T) {
 
 	url := "ws" + strings.TrimPrefix(server.URL, "http")
 	ctx := context.Background()
-	wsm := wsmanager.NewWSManager(url, ctx)
-	wsm.SetLogger(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})))
+	wsm := wsmanager.NewWSManager(url, ctx, slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})))
 
 	err := wsm.Connect()
 	if err != nil {
@@ -764,8 +771,7 @@ func TestCloseMultipleTimes(t *testing.T) {
 
 	url := "ws" + strings.TrimPrefix(server.URL, "http")
 	ctx := context.Background()
-	wsm := wsmanager.NewWSManager(url, ctx)
-	wsm.SetLogger(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})))
+	wsm := wsmanager.NewWSManager(url, ctx, slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})))
 
 	err := wsm.Connect()
 	if err != nil {
@@ -788,8 +794,7 @@ func TestCreateWsManager(t *testing.T) {
 
 	ctx := context.Background()
 
-	wsm := wsmanager.NewWSManager(url, ctx)
-	wsm.SetLogger(logger)
+	wsm := wsmanager.NewWSManager(url, ctx, logger)
 	err := wsm.Connect()
 	if err != nil {
 		t.Fatalf("Connect failed: %v", err)
@@ -844,8 +849,7 @@ func TestConnectDisconnect(t *testing.T) {
 
 	ctx := context.Background()
 
-	wsm := wsmanager.NewWSManager(url, ctx)
-	wsm.SetLogger(logger)
+	wsm := wsmanager.NewWSManager(url, ctx, logger)
 	err := wsm.Connect()
 	if err != nil {
 		t.Fatalf("Connect failed: %v", err)
@@ -884,4 +888,241 @@ func TestConnectDisconnect(t *testing.T) {
 
 	time.Sleep(1 * time.Second)
 	wsm.Close()
+}
+
+func TestConcurrentGetReqIdUnique(t *testing.T) {
+	ctx := context.Background()
+	wsm := wsmanager.NewWSManager("wss://example.com/ws", ctx, nil)
+
+	const goroutines = 32
+	const perGoroutine = 100
+	total := goroutines * perGoroutine
+
+	ids := make(chan string, total)
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+	for i := 0; i < goroutines; i++ {
+		go func() {
+			defer wg.Done()
+			for j := 0; j < perGoroutine; j++ {
+				ids <- wsm.GetReqId("order")
+			}
+		}()
+	}
+	wg.Wait()
+	close(ids)
+
+	seen := make(map[string]struct{}, total)
+	for id := range ids {
+		if !strings.HasPrefix(id, "order_") {
+			t.Fatalf("unexpected id format: %q", id)
+		}
+		if _, dup := seen[id]; dup {
+			t.Fatalf("duplicate request id: %s", id)
+		}
+		seen[id] = struct{}{}
+	}
+	if len(seen) != total {
+		t.Fatalf("unique ids = %d, want %d", len(seen), total)
+	}
+}
+
+func TestSetPingerNilConnectAndShutdown(t *testing.T) {
+	server := mockWebSocketServer(t, func(conn *websocket.Conn) {
+		ctx := context.Background()
+		for {
+			_, _, err := conn.Read(ctx)
+			if err != nil {
+				return
+			}
+		}
+	})
+	defer server.Close()
+
+	url := "ws" + strings.TrimPrefix(server.URL, "http")
+	wsm := wsmanager.NewWSManager(url, context.Background(), slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})))
+	wsm.SetPinger(nil)
+
+	if err := wsm.Connect(); err != nil {
+		t.Fatalf("Connect with nil pinger: %v", err)
+	}
+	if wsm.GetConnState() != states.StateConnected {
+		t.Fatalf("state = %v, want Connected", wsm.GetConnState())
+	}
+
+	if err := wsm.SendRequest(map[string]any{"op": "ping"}); err != nil {
+		t.Fatalf("SendRequest: %v", err)
+	}
+
+	if err := wsm.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	waitReturned := make(chan struct{})
+	go func() {
+		wsm.Wait()
+		close(waitReturned)
+	}()
+
+	select {
+	case <-waitReturned:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Wait hung with SetPinger(nil)")
+	}
+}
+
+func TestCanceledParentContextDoesNotLeaveConnecting(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	wsm := wsmanager.NewWSManager("wss://example.com/ws", ctx, slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})))
+
+	err := wsm.Connect()
+	if err == nil {
+		t.Fatal("expected Connect error with canceled parent context")
+	}
+	if wsm.GetConnState() == states.StateConnecting {
+		t.Fatal("Connect left manager in StateConnecting after canceled parent context")
+	}
+	if wsm.GetConnState() != states.StateDisconnected {
+		t.Fatalf("state = %v, want Disconnected", wsm.GetConnState())
+	}
+}
+
+func TestCanceledParentAfterCloseDoesNotLeaveConnecting(t *testing.T) {
+	server := mockWebSocketServer(t, func(conn *websocket.Conn) {
+		time.Sleep(2 * time.Second)
+	})
+	defer server.Close()
+
+	url := "ws" + strings.TrimPrefix(server.URL, "http")
+	parent, cancel := context.WithCancel(context.Background())
+	wsm := wsmanager.NewWSManager(url, parent, slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})))
+	wsm.SetPinger(nil)
+
+	if err := wsm.Connect(); err != nil {
+		t.Fatalf("initial connect: %v", err)
+	}
+	if err := wsm.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	// Parent cancellation must win over reconnect attempts.
+	cancel()
+
+	err := wsm.Connect()
+	if err == nil {
+		t.Fatal("expected Connect error after parent cancel")
+	}
+	if wsm.GetConnState() == states.StateConnecting {
+		t.Fatal("reconnect left manager in StateConnecting after parent cancel")
+	}
+	if wsm.GetConnState() != states.StateDisconnected {
+		t.Fatalf("state = %v, want Disconnected", wsm.GetConnState())
+	}
+}
+
+func TestDefaultReadLimitConstant(t *testing.T) {
+	if wsmanager.DefaultReadLimit != 4<<20 {
+		t.Fatalf("DefaultReadLimit = %d, want %d", wsmanager.DefaultReadLimit, 4<<20)
+	}
+}
+
+func TestSetReadLimitRejectsNonPositive(t *testing.T) {
+	wsm := wsmanager.NewWSManager("wss://example.com/ws", context.Background(), nil)
+	for _, limit := range []int64{0, -1, -100} {
+		err := wsm.SetReadLimit(limit)
+		if err == nil {
+			t.Fatalf("SetReadLimit(%d) expected error", limit)
+		}
+		if !strings.Contains(err.Error(), "invalid read limit") {
+			t.Fatalf("SetReadLimit(%d) error %q does not identify invalid read limit", limit, err.Error())
+		}
+	}
+}
+
+func TestSetReadLimitOverrideAndOversizedDisconnect(t *testing.T) {
+	const limit int64 = 64
+	oversized := strings.Repeat("x", int(limit)+16)
+
+	server := mockWebSocketServer(t, func(conn *websocket.Conn) {
+		ctx := context.Background()
+		// Small frame first so connect settles, then oversized.
+		_ = conn.Write(ctx, websocket.MessageText, []byte(`{"ok":true}`))
+		_ = conn.Write(ctx, websocket.MessageText, []byte(oversized))
+		_, _, _ = conn.Read(ctx)
+	})
+	defer server.Close()
+
+	url := "ws" + strings.TrimPrefix(server.URL, "http")
+	wsm := wsmanager.NewWSManager(url, context.Background(), slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})))
+	wsm.SetPinger(nil)
+	if err := wsm.SetReadLimit(limit); err != nil {
+		t.Fatalf("SetReadLimit: %v", err)
+	}
+
+	if err := wsm.Connect(); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+
+	// Deliver the small frame.
+	select {
+	case frame := <-wsm.DataCh:
+		if string(frame.Data) != `{"ok":true}` {
+			t.Fatalf("unexpected frame %s", frame.Data)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for small frame")
+	}
+
+	select {
+	case <-wsm.DisconnectSig:
+	case <-time.After(3 * time.Second):
+		t.Fatal("expected disconnect after oversized message")
+	}
+
+	if wsm.GetConnState() != states.StateDisconnected {
+		t.Fatalf("state = %v, want Disconnected", wsm.GetConnState())
+	}
+
+	wsm.Close()
+	wsm.Wait()
+}
+
+func TestSetReadLimitAppliesToCurrentConnection(t *testing.T) {
+	const limit int64 = 32
+	oversized := strings.Repeat("y", int(limit)+8)
+	writeOversize := make(chan struct{})
+
+	server := mockWebSocketServer(t, func(conn *websocket.Conn) {
+		ctx := context.Background()
+		<-writeOversize
+		_ = conn.Write(ctx, websocket.MessageText, []byte(oversized))
+		_, _, _ = conn.Read(ctx)
+	})
+	defer server.Close()
+
+	url := "ws" + strings.TrimPrefix(server.URL, "http")
+	wsm := wsmanager.NewWSManager(url, context.Background(), slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})))
+	wsm.SetPinger(nil)
+
+	// Connect with default 4MiB limit, then tighten on the live connection.
+	if err := wsm.Connect(); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	if err := wsm.SetReadLimit(limit); err != nil {
+		t.Fatalf("SetReadLimit: %v", err)
+	}
+	close(writeOversize)
+
+	select {
+	case <-wsm.DisconnectSig:
+	case <-time.After(3 * time.Second):
+		t.Fatal("expected disconnect after live SetReadLimit + oversized message")
+	}
+	if wsm.GetConnState() != states.StateDisconnected {
+		t.Fatalf("state = %v, want Disconnected", wsm.GetConnState())
+	}
+	wsm.Close()
+	wsm.Wait()
 }
