@@ -84,7 +84,7 @@ func TestStaleSendRequestDoesNotCloseNewConnection(t *testing.T) {
 		// Underlying socket may already be fully torn down; force the fail path.
 		t.Log("stale WriteJSON unexpectedly succeeded; still exercising failConnection")
 	} else {
-		m.Logger.Error("failed to send message", "error", err)
+		m.Logger().Error("failed to send message", "error", err)
 	}
 	if m.failConnection(oldConn, "connection lost") {
 		t.Fatal("failConnection on stale conn unexpectedly succeeded")

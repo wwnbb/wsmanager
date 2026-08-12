@@ -13,15 +13,12 @@ import (
 )
 
 type WSConnection struct {
-	*websocket.Conn
+	conn *websocket.Conn
 
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	lastPing time.Time
-
 	writeMu sync.Mutex
-	pingMu  sync.Mutex
 
 	// id uniquely identifies this connection instance for stale-teardown guards.
 	id uint64
@@ -37,24 +34,23 @@ type ReceivedFrame struct {
 	ReceivedAt time.Time
 }
 
-func (c *WSConnection) GetConn() *websocket.Conn {
-	return c.Conn
-}
-
 func (c *WSConnection) WriteJSON(v any) error {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
 
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	ctx, cancel := context.WithTimeout(c.ctx, time.Minute)
 	defer cancel()
 
-	return wsjson.Write(ctx, c.Conn, v)
+	return wsjson.Write(ctx, c.conn, v)
 }
 
-func (c *WSConnection) WritePing(ctx context.Context) error {
+// writeJSONWithCtx is the pinger entry point: it serializes payload under
+// writeMu but uses the caller-supplied ctx as the per-attempt deadline budget
+// instead of WriteJSON's fixed time.Minute. Not exported: pinger-only.
+func (c *WSConnection) writeJSONWithCtx(ctx context.Context, v any) error {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
-	return c.Conn.Ping(ctx)
+	return wsjson.Write(ctx, c.conn, v)
 }
 
 func (m *WSManager) GetConnState() states.ConnectionState {
@@ -62,7 +58,7 @@ func (m *WSManager) GetConnState() states.ConnectionState {
 }
 
 // closeDetachedConn tears down a connection that has already been detached from
-// m.Conn (or is otherwise unshared). Locks must not be held by the caller.
+// m.conn (or is otherwise unshared). Locks must not be held by the caller.
 //
 // stopPinger controls whether conn.pinger.Stop is invoked:
 //   - true: reader/SendRequest/Close/connect-failure paths (cancel then Stop).
@@ -79,7 +75,7 @@ func closeDetachedConn(conn *WSConnection, closeCode websocket.StatusCode, reaso
 	if stopPinger && conn.pinger != nil {
 		conn.pinger.Stop()
 	}
-	if conn.Conn != nil {
-		_ = conn.Conn.Close(closeCode, reason)
+	if conn.conn != nil {
+		_ = conn.conn.Close(closeCode, reason)
 	}
 }

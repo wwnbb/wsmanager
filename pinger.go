@@ -8,8 +8,6 @@ import (
 	"log/slog"
 	"sync"
 	"time"
-
-	"github.com/coder/websocket/wsjson"
 )
 
 const (
@@ -72,12 +70,8 @@ func (p *DefaultPinger) Ping(ctx context.Context, conn *WSConnection, reqIdFunc 
 		"req_id": reqIdFunc("ping"),
 		"op":     "ping",
 	}
-
-	conn.writeMu.Lock()
-	defer conn.writeMu.Unlock()
-
 	// ctx is the per-attempt budget (and inherits manager cancellation).
-	return wsjson.Write(ctx, conn.Conn, payload)
+	return conn.writeJSONWithCtx(ctx, payload)
 }
 
 func (p *DefaultPinger) GetInterval() time.Duration {

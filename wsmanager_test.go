@@ -2,6 +2,7 @@ package wsmanager_test
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -14,7 +15,6 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
-	json "github.com/goccy/go-json"
 	pp "github.com/wwnbb/pprint"
 	"github.com/wwnbb/wsmanager"
 	"github.com/wwnbb/wsmanager/states"
@@ -38,7 +38,7 @@ func TestNewWSManager(t *testing.T) {
 		t.Error("DataCh should not be nil")
 	}
 
-	if wsm.Logger == nil {
+	if wsm.Logger() == nil {
 		t.Error("Logger should not be nil")
 	}
 }
@@ -50,7 +50,7 @@ func TestSetLogger(t *testing.T) {
 	customLogger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	wsm.SetLogger(customLogger)
 
-	if wsm.Logger != customLogger {
+	if wsm.Logger() != customLogger {
 		t.Error("Logger was not set correctly")
 	}
 }

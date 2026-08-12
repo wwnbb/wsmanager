@@ -92,7 +92,7 @@ func dialTestConn(t *testing.T, handler func(*websocket.Conn)) (*WSConnection, *
 	}
 	connCtx, connCancel := context.WithCancel(context.Background())
 	conn := &WSConnection{
-		Conn:   wsConn,
+		conn:   wsConn,
 		ctx:    connCtx,
 		cancel: connCancel,
 	}
@@ -383,7 +383,7 @@ func TestHeartbeatActiveWriteErrorOnErrorOnce(t *testing.T) {
 		}
 	})
 	// Force subsequent writes to fail without canceling manager ctx.
-	conn.Conn.CloseNow()
+	conn.conn.CloseNow()
 
 	p := newTestDefaultPinger(time.Hour, 200*time.Millisecond, 3)
 	pongCh := make(chan struct{}, 1)
@@ -438,7 +438,7 @@ func TestHeartbeatPendingPongAcceptedBetweenRetries(t *testing.T) {
 	pongCh := p.pongCh
 	p.mu.Unlock()
 
-	conn := &WSConnection{Conn: wsConn, ctx: context.Background(), cancel: func() {}, pinger: p}
+	conn := &WSConnection{conn: wsConn, ctx: context.Background(), cancel: func() {}, pinger: p}
 	done := make(chan struct{})
 	var onErr atomic.Int32
 
