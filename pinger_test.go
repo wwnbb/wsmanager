@@ -53,6 +53,8 @@ func TestIsBybitPong(t *testing.T) {
 	}{
 		{"valid", `{"success":true,"ret_msg":"pong","op":"ping","conn_id":"x"}`, true},
 		{"valid_with_req_id", `{"success":true,"ret_msg":"pong","op":"ping","req_id":"ping_1"}`, true},
+		{"valid_leading_spaces", `  {"success":true,"ret_msg":"pong","op":"ping"}`, true},
+		{"valid_leading_tab_newline", "\t\n{\"success\":true,\"ret_msg\":\"pong\",\"op\":\"ping\"}", true},
 		{"success_false", `{"success":false,"ret_msg":"pong","op":"ping"}`, false},
 		{"wrong_ret_msg", `{"success":true,"ret_msg":"ok","op":"ping"}`, false},
 		{"wrong_op", `{"success":true,"ret_msg":"pong","op":"pong"}`, false},

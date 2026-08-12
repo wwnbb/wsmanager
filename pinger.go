@@ -16,6 +16,7 @@ const (
 )
 
 // Pinger manages application-level keepalive for a single connection generation.
+// Stop may block; the manager bounds it with a watchdog timeout of pingerStopTimeout.
 type Pinger interface {
 	Start(ctx context.Context, conn *WSConnection, logger *slog.Logger, reqIdFunc func(topic string) string, onError func())
 	HandleMessage(
@@ -170,7 +171,8 @@ func waitPong(ctx context.Context, done <-chan struct{}, pongCh <-chan struct{},
 // Required fields: success=true, ret_msg="pong", op="ping". req_id is optional.
 func isBybitPong(data []byte) bool {
 	// Cheap prefilter: high-volume market frames skip full JSON decode.
-	if len(data) == 0 || data[0] != '{' {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || trimmed[0] != '{' {
 		return false
 	}
 	if !bytes.Contains(data, []byte(`"pong"`)) {

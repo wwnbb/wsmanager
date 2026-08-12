@@ -2,6 +2,7 @@ package wsmanager
 
 import (
 	"context"
+	"log/slog"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -11,6 +12,11 @@ import (
 
 	"github.com/wwnbb/wsmanager/states"
 )
+
+// pingerStopTimeout bounds Pinger.Stop during teardown. A Stop that exceeds it
+// is logged once and teardown proceeds; the leaked Stop goroutine is unblocked
+// whenever the pinger implementation eventually returns.
+const pingerStopTimeout = 5 * time.Second
 
 type WSConnection struct {
 	conn *websocket.Conn
@@ -73,7 +79,18 @@ func closeDetachedConn(conn *WSConnection, closeCode websocket.StatusCode, reaso
 		conn.cancel()
 	}
 	if stopPinger && conn.pinger != nil {
-		conn.pinger.Stop()
+		// Stop may block; bound it with a watchdog so a hung Stop cannot jam
+		// Close/reconnect teardown. No manager logger is reachable here.
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			conn.pinger.Stop()
+		}()
+		select {
+		case <-done:
+		case <-time.After(pingerStopTimeout):
+			slog.Default().Error("pinger Stop exceeded watchdog timeout", "timeout", pingerStopTimeout)
+		}
 	}
 	if conn.conn != nil {
 		_ = conn.conn.Close(closeCode, reason)

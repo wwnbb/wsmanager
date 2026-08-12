@@ -60,6 +60,11 @@ type WSManager struct {
 // Wait blocks until the current connection's reader and pinger have stopped.
 // Queued DataCh frames remain readable; draining is not required for Wait to return.
 func (m *WSManager) Wait() {
+	// Serialize with an in-flight Connect so its disconnectWg.Add is registered
+	// before the counter is observed. Acquire/release only: refreshContext
+	// waits on disconnectWg directly and must not hold connectMu (deadlock).
+	m.connectMu.Lock()
+	m.connectMu.Unlock()
 	m.disconnectWg.Wait()
 }
 
@@ -473,6 +478,9 @@ func (m *WSManager) Connect() error {
 				m.failConnectionFromPinger(conn, "connection lost")
 			}
 			pinger.Start(conn.ctx, conn, logger, m.GetReqId, onError)
+			// Start returned without onError: exit-failConnection safety net.
+			// Idempotent no-op after onError or intentional Close.
+			m.failConnection(conn, "connection lost")
 		}()
 	}
 
@@ -539,68 +547,74 @@ func (m *WSManager) readMessages(conn *WSConnection) {
 	logger.Debug("Starting ReadMessages")
 	defer logger.Debug("Exiting ReadMessages")
 
+loop:
 	for {
 		select {
 		case <-conn.ctx.Done():
 			logger.Debug("Read messages context done, exiting")
-			return
+			break loop
 		default:
-			if !m.isCurrentConn(conn) || m.GetConnState() != states.StateConnected {
-				return
-			}
+		}
 
-			func() {
-				defer func() {
-					if r := recover(); r != nil {
-						logger.Error("recovered from panic in ReadMessage", "panic", r)
-						m.failConnection(conn, "connection lost")
-						return
-					}
-				}()
+		if !m.isCurrentConn(conn) || m.GetConnState() != states.StateConnected {
+			break loop
+		}
 
-				messageType, reader, err := conn.conn.Reader(conn.ctx)
-				if err != nil {
-					m.handleReaderError(conn, err)
-					return
-				}
-
-				b := bpool.Get()
-				defer bpool.Put(b)
-
-				_, err = b.ReadFrom(reader)
-				if err != nil {
-					if errors.Is(err, context.DeadlineExceeded) {
-						logger.Error("read timeout")
-					} else {
-						logger.Error("failed to read message", "error", err)
-					}
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					logger.Error("recovered from panic in ReadMessage", "panic", r)
 					m.failConnection(conn, "connection lost")
 					return
 				}
-				receivedAt := time.Now()
-				frame := ReceivedFrame{
-					Type:       messageType,
-					Data:       append([]byte(nil), b.Bytes()...),
-					ReceivedAt: receivedAt,
-				}
-
-				if conn.pinger != nil && conn.pinger.HandleMessage(conn.ctx, conn, frame, logger) {
-					return
-				}
-
-				// Cancellation wins over a blocked DataCh send: drop this in-flight frame.
-				select {
-				case m.DataCh <- frame:
-					if logger.Enabled(context.Background(), slog.LevelDebug) {
-						logger.Debug("received message", "type", frame.Type, "data", pp.PrettyFormat(frame.Data))
-					}
-				case <-conn.ctx.Done():
-					logger.Debug("dropping in-flight frame on connection cancel")
-					return
-				}
 			}()
-		}
+
+			messageType, reader, err := conn.conn.Reader(conn.ctx)
+			if err != nil {
+				m.handleReaderError(conn, err)
+				return
+			}
+
+			b := bpool.Get()
+			defer bpool.Put(b)
+
+			_, err = b.ReadFrom(reader)
+			if err != nil {
+				if errors.Is(err, context.DeadlineExceeded) {
+					logger.Error("read timeout")
+				} else {
+					logger.Error("failed to read message", "error", err)
+				}
+				m.failConnection(conn, "connection lost")
+				return
+			}
+			receivedAt := time.Now()
+			frame := ReceivedFrame{
+				Type:       messageType,
+				Data:       append([]byte(nil), b.Bytes()...),
+				ReceivedAt: receivedAt,
+			}
+
+			if conn.pinger != nil && conn.pinger.HandleMessage(conn.ctx, conn, frame, logger) {
+				return
+			}
+
+			// Cancellation wins over a blocked DataCh send: drop this in-flight frame.
+			select {
+			case m.DataCh <- frame:
+				if logger.Enabled(context.Background(), slog.LevelDebug) {
+					logger.Debug("received message", "type", frame.Type, "data", pp.PrettyFormat(frame.Data))
+				}
+			case <-conn.ctx.Done():
+				logger.Debug("dropping in-flight frame on connection cancel")
+				return
+			}
+		}()
 	}
+
+	// Every loop exit lands here. Generation-guarded and idempotent: no-op on
+	// intentional Close (already detached/Disconnected) and on stale generations.
+	m.failConnection(conn, "connection lost")
 }
 
 // Close stops the current connection. DataCh remains open for reconnects.
