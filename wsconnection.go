@@ -18,6 +18,11 @@ import (
 // whenever the pinger implementation eventually returns.
 const pingerStopTimeout = 5 * time.Second
 
+// closeHandshakeTimeout bounds the WebSocket close handshake during teardown.
+// A peer that never answers the close frame forces a CloseNow fallback so
+// Close/failConnection cannot block indefinitely on a mute peer.
+const closeHandshakeTimeout = 5 * time.Second
+
 type WSConnection struct {
 	conn *websocket.Conn
 
@@ -93,6 +98,21 @@ func closeDetachedConn(conn *WSConnection, closeCode websocket.StatusCode, reaso
 		}
 	}
 	if conn.conn != nil {
-		_ = conn.conn.Close(closeCode, reason)
+		// Close blocks until the peer answers the close handshake; a mute peer
+		// would jam teardown forever, so bound it and fall back to CloseNow.
+		// No manager logger is reachable here.
+		done := make(chan error, 1)
+		go func() {
+			done <- conn.conn.Close(closeCode, reason)
+		}()
+		select {
+		case err := <-done:
+			if err != nil {
+				slog.Default().Warn("websocket close handshake failed", "error", err)
+			}
+		case <-time.After(closeHandshakeTimeout):
+			slog.Default().Error("websocket close handshake exceeded watchdog timeout", "timeout", closeHandshakeTimeout)
+			_ = conn.conn.CloseNow()
+		}
 	}
 }

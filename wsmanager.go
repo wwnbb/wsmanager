@@ -54,6 +54,12 @@ type WSManager struct {
 
 	nextConnID atomic.Uint64
 
+	// httpClient/transport are built once in NewWSManager and reused across
+	// Connect calls so failed-dial retries cannot accumulate idle connections;
+	// transport stays directly accessible for CloseIdleConnections in Close.
+	httpClient *http.Client
+	transport  *http.Transport
+
 	Pinger Pinger
 }
 
@@ -292,8 +298,16 @@ func NewWSManager(url string, parentCtx context.Context, logger *slog.Logger, da
 	if logger == nil {
 		logger = slog.Default()
 	}
+	transport := &http.Transport{
+		TLSHandshakeTimeout:   10 * time.Second,
+		ResponseHeaderTimeout: 10 * time.Second,
+		DisableKeepAlives:     false,
+		MaxIdleConnsPerHost:   -1,
+	}
 	wsm := &WSManager{
 		requestIds:    dlht.New[string, int](dlht.Options{}),
+		httpClient:    &http.Client{Transport: transport},
+		transport:     transport,
 		url:           url,
 		connState:     states.StateNew,
 		parentCtx:     parentCtx,
@@ -399,16 +413,7 @@ func (m *WSManager) Connect() error {
 	dialCtx, dialCancel := context.WithTimeout(mgrCtx, 15*time.Second)
 	defer dialCancel()
 
-	opts := &websocket.DialOptions{
-		HTTPClient: &http.Client{
-			Transport: &http.Transport{
-				TLSHandshakeTimeout:   10 * time.Second,
-				ResponseHeaderTimeout: 10 * time.Second,
-				DisableKeepAlives:     false,
-				MaxIdleConnsPerHost:   -1,
-			},
-		},
-	}
+	opts := &websocket.DialOptions{HTTPClient: m.httpClient}
 
 	wsConn, _, err := websocket.Dial(dialCtx, m.url, opts)
 	if err != nil {
@@ -631,6 +636,7 @@ func (m *WSManager) Close() error {
 	m.SetDisconnectedFromConnected()
 	m.SetDisconnectedFromConnecting()
 	m.closeConn(websocket.StatusNormalClosure, "done")
+	m.transport.CloseIdleConnections()
 	return nil
 }
 
