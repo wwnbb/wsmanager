@@ -14,8 +14,6 @@ import (
 
 	"github.com/coder/websocket"
 
-	"github.com/jeremiah-masters/dlht"
-
 	pp "github.com/wwnbb/pprint"
 	"github.com/wwnbb/wsmanager/bpool"
 	"github.com/wwnbb/wsmanager/states"
@@ -24,6 +22,19 @@ import (
 // DefaultReadLimit is the default maximum size in bytes of a complete inbound
 // WebSocket message (4 MiB).
 const DefaultReadLimit int64 = 4 << 20
+
+// ErrConnectionReplaced is returned by SendRequest when its connection snapshot
+// was superseded by a newer generation before/while the write completed. The
+// newer connection is authoritative and is not torn down.
+var ErrConnectionReplaced = errors.New("websocket connection replaced")
+
+// DisconnectEvent is delivered on DisconnectSig to describe why a connection
+// tore down. Reason is a short human-readable string; Err is the best-effort
+// underlying error (nil for intentional close or when no specific error applies).
+type DisconnectEvent struct {
+	Reason string
+	Err    error
+}
 
 type WSManager struct {
 	logger atomic.Pointer[slog.Logger]
@@ -42,10 +53,10 @@ type WSManager struct {
 	// frame blocked on send is dropped when the connection context is canceled;
 	// callers need not drain DataCh for Wait to return.
 	DataCh        chan ReceivedFrame
-	DisconnectSig chan struct{}
+	DisconnectSig chan DisconnectEvent
 	disconnectWg  sync.WaitGroup
 
-	requestIds *dlht.Map[string, int]
+	requestIds map[string]int
 	reqIDMu    sync.Mutex
 	connMu     sync.RWMutex
 	connectMu  sync.Mutex
@@ -173,13 +184,13 @@ func (m *WSManager) GetReqId(topic string) string {
 	m.reqIDMu.Lock()
 	defer m.reqIDMu.Unlock()
 
-	if n, exist := m.requestIds.Get(topic); exist {
+	if n, ok := m.requestIds[topic]; ok {
 		id := n + 1
-		m.requestIds.Put(topic, id)
+		m.requestIds[topic] = id
 		return fmt.Sprintf("%s_%d", topic, id)
 	}
 
-	m.requestIds.Insert(topic, 1)
+	m.requestIds[topic] = 1
 	return fmt.Sprintf("%s_%d", topic, 1)
 }
 
@@ -219,15 +230,15 @@ func (m *WSManager) setDisconnected(from states.ConnectionState, reason string) 
 	}
 
 	m.closeConn(websocket.StatusNormalClosure, reason)
-	m.notifyDisconnect()
+	m.notifyDisconnect(reason, nil)
 	return true
 }
 
 // failConnection disconnects only when conn is still the active connection and
 // the manager is Connected. Stale failures from older connections are ignored.
 // Always stops the snapshotted pinger (reader/send paths).
-func (m *WSManager) failConnection(conn *WSConnection, reason string) bool {
-	return m.failConnectionLocked(conn, reason, true)
+func (m *WSManager) failConnection(conn *WSConnection, reason string, err error) bool {
+	return m.failConnectionLocked(conn, reason, true, err)
 }
 
 // failConnectionFromPinger is the generation-scoped failure path for callbacks
@@ -237,13 +248,13 @@ func (m *WSManager) failConnection(conn *WSConnection, reason string) bool {
 // websocket, and signals DisconnectSig — but does not call Pinger.Stop.
 // onError is the terminal callback for that Start invocation; Start must return
 // after invoking it. Calling Stop here would deadlock if Stop waits for Start.
-func (m *WSManager) failConnectionFromPinger(conn *WSConnection, reason string) bool {
-	return m.failConnectionLocked(conn, reason, false)
+func (m *WSManager) failConnectionFromPinger(conn *WSConnection, reason string, err error) bool {
+	return m.failConnectionLocked(conn, reason, false, err)
 }
 
 // failConnectionLocked performs generation-aware Connected→Disconnected teardown.
 // Manager locks are released before cancel/Close/log/notify.
-func (m *WSManager) failConnectionLocked(conn *WSConnection, reason string, stopPinger bool) bool {
+func (m *WSManager) failConnectionLocked(conn *WSConnection, reason string, stopPinger bool, err error) bool {
 	if conn == nil {
 		return false
 	}
@@ -263,7 +274,7 @@ func (m *WSManager) failConnectionLocked(conn *WSConnection, reason string, stop
 
 	m.Logger().Debug("SetDisconnected", "from", states.StateConnected, "to", states.StateDisconnected, "reason", reason)
 	closeDetachedConn(current, websocket.StatusNormalClosure, reason, stopPinger)
-	m.notifyDisconnect()
+	m.notifyDisconnect(reason, err)
 	return true
 }
 
@@ -280,9 +291,9 @@ func (m *WSManager) SetConnectingFromDisconnected() bool {
 	return changeState(states.StateDisconnected, states.StateConnecting, m)
 }
 
-func (m *WSManager) notifyDisconnect() {
+func (m *WSManager) notifyDisconnect(reason string, err error) {
 	select {
-	case m.DisconnectSig <- struct{}{}:
+	case m.DisconnectSig <- DisconnectEvent{Reason: reason, Err: err}:
 	default:
 	}
 }
@@ -305,7 +316,7 @@ func NewWSManager(url string, parentCtx context.Context, logger *slog.Logger, da
 		MaxIdleConnsPerHost:   -1,
 	}
 	wsm := &WSManager{
-		requestIds:    dlht.New[string, int](dlht.Options{}),
+		requestIds:    make(map[string]int),
 		httpClient:    &http.Client{Transport: transport},
 		transport:     transport,
 		url:           url,
@@ -315,7 +326,7 @@ func NewWSManager(url string, parentCtx context.Context, logger *slog.Logger, da
 		ctxCancel:     cancel,
 		readLimit:     DefaultReadLimit,
 		DataCh:        make(chan ReceivedFrame, chSz),
-		DisconnectSig: make(chan struct{}, 1),
+		DisconnectSig: make(chan DisconnectEvent, 1),
 		Pinger:        NewDefaultPinger(),
 	}
 	wsm.logger.Store(logger)
@@ -475,17 +486,17 @@ func (m *WSManager) Connect() error {
 				if r := recover(); r != nil {
 					m.Logger().Error("recovered from panic in Pinger.Start", "panic", r)
 					// Same no-Stop path as onError: Start is unwinding through recover.
-					m.failConnectionFromPinger(conn, "connection lost")
+					m.failConnectionFromPinger(conn, "connection lost", nil)
 				}
 			}()
 			// onError is terminal for this Start: do not Stop from that path.
 			onError := func() {
-				m.failConnectionFromPinger(conn, "connection lost")
+				m.failConnectionFromPinger(conn, "connection lost", nil)
 			}
 			pinger.Start(conn.ctx, conn, logger, m.GetReqId, onError)
 			// Start returned without onError: exit-failConnection safety net.
 			// Idempotent no-op after onError or intentional Close.
-			m.failConnection(conn, "connection lost")
+			m.failConnection(conn, "connection lost", nil)
 		}()
 	}
 
@@ -509,29 +520,29 @@ func (m *WSManager) handleReaderError(conn *WSConnection, err error) {
 		default:
 			logger.Error("connection closed with error", "code", closeErr.Code, "reason", closeErr.Reason)
 		}
-		m.failConnection(conn, "connection lost")
+		m.failConnection(conn, "connection lost", closeErr)
 		return
 	}
 
 	if errors.Is(err, net.ErrClosed) {
 		logger.Warn("connection already closed")
-		m.failConnection(conn, "connection lost")
+		m.failConnection(conn, "connection lost", err)
 		return
 	}
 
 	if errors.Is(err, context.DeadlineExceeded) {
 		logger.Warn("read context deadline exceeded")
-		m.failConnection(conn, "connection lost")
+		m.failConnection(conn, "connection lost", err)
 		return
 	}
 	if errors.Is(err, context.Canceled) {
 		logger.Warn("read context canceled")
-		m.failConnection(conn, "connection lost")
+		m.failConnection(conn, "connection lost", err)
 		return
 	}
 
 	logger.Error("failed to get reader", "error", err, "conn_state", m.GetConnState().String())
-	m.failConnection(conn, "connection lost")
+	m.failConnection(conn, "connection lost", err)
 }
 
 func (m *WSManager) readMessages(conn *WSConnection) {
@@ -539,7 +550,7 @@ func (m *WSManager) readMessages(conn *WSConnection) {
 	defer func() {
 		if r := recover(); r != nil {
 			logger.Error("recovered from panic in readMessages", "panic", r)
-			m.failConnection(conn, "connection lost")
+			m.failConnection(conn, "connection lost", nil)
 			return
 		}
 	}()
@@ -569,7 +580,7 @@ loop:
 			defer func() {
 				if r := recover(); r != nil {
 					logger.Error("recovered from panic in ReadMessage", "panic", r)
-					m.failConnection(conn, "connection lost")
+					m.failConnection(conn, "connection lost", nil)
 					return
 				}
 			}()
@@ -590,7 +601,7 @@ loop:
 				} else {
 					logger.Error("failed to read message", "error", err)
 				}
-				m.failConnection(conn, "connection lost")
+				m.failConnection(conn, "connection lost", err)
 				return
 			}
 			receivedAt := time.Now()
@@ -619,7 +630,7 @@ loop:
 
 	// Every loop exit lands here. Generation-guarded and idempotent: no-op on
 	// intentional Close (already detached/Disconnected) and on stale generations.
-	m.failConnection(conn, "connection lost")
+	m.failConnection(conn, "connection lost", nil)
 }
 
 // Close stops the current connection. DataCh remains open for reconnects.
@@ -653,8 +664,16 @@ func (m *WSManager) SendRequest(v any) error {
 	err := conn.WriteJSON(v)
 	if err != nil {
 		m.Logger().Error("failed to send message", "error", err)
-		// Only tear down this connection generation; never a newer one.
-		m.failConnection(conn, "connection lost")
+		// If the snapshot was replaced by a newer generation, the new connection
+		// is authoritative: do not tear it down. Report a distinct error so
+		// callers can distinguish a race-driven write loss from a real failure.
+		cur := m.getConn()
+		if cur != nil && cur.id != conn.id {
+			return fmt.Errorf("%w", ErrConnectionReplaced)
+		}
+		// cur == nil (closed) or cur.id == conn.id (genuine write error on the
+		// current connection): tear down this generation only.
+		m.failConnection(conn, "connection lost", err)
 		return fmt.Errorf("failed to send message: %w", err)
 	}
 

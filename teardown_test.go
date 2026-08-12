@@ -2,6 +2,7 @@ package wsmanager_test
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"os"
 	"strings"
@@ -213,4 +214,77 @@ func TestBlockingPingerStopDoesNotHangClose(t *testing.T) {
 	case <-time.After(7 * time.Second):
 		t.Fatal("Wait did not return after Close with hung pinger Stop")
 	}
+}
+
+// TestDisconnectEventCarriesReason asserts that DisconnectSig delivers a typed
+// DisconnectEvent whose Reason is non-empty and whose Err reflects the teardown
+// origin: a peer close surfaces the underlying read error; an intentional Close
+// surfaces a nil Err.
+func TestDisconnectEventCarriesReason(t *testing.T) {
+	server := mockWebSocketServer(t, func(conn *websocket.Conn) {
+		_ = conn.Close(websocket.StatusNormalClosure, "server closing")
+		_, _, _ = conn.Read(context.Background())
+	})
+	defer server.Close()
+
+	url := "ws" + strings.TrimPrefix(server.URL, "http")
+	wsm := wsmanager.NewWSManager(url, context.Background(), slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})))
+	wsm.SetPinger(nil)
+
+	if err := wsm.Connect(); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+
+	var event wsmanager.DisconnectEvent
+	select {
+	case event = <-wsm.DisconnectSig:
+	case <-time.After(3 * time.Second):
+		t.Fatal("DisconnectSig did not fire after peer close")
+	}
+	if event.Reason == "" {
+		t.Error("expected non-empty Reason on DisconnectEvent after peer close")
+	}
+	if event.Err == nil {
+		t.Error("expected non-nil Err on DisconnectEvent after peer close")
+	} else {
+		var closeErr websocket.CloseError
+		if !errors.As(event.Err, &closeErr) {
+			t.Errorf("expected DisconnectEvent.Err to wrap a websocket.CloseError, got %T: %v", event.Err, event.Err)
+		}
+	}
+	if wsm.GetConnState() != states.StateDisconnected {
+		t.Fatalf("state = %v, want Disconnected", wsm.GetConnState())
+	}
+	wsm.Wait()
+
+	// Intentional Close path: a fresh manager, then Close. DisconnectSig's
+	// buffer holds at most one event; the reader-error path above already
+	// drained its single slot, so use a fresh manager for the Close path.
+	closeServer := mockWebSocketServer(t, func(conn *websocket.Conn) {
+		_, _, _ = conn.Read(context.Background())
+	})
+	defer closeServer.Close()
+	closeURL := "ws" + strings.TrimPrefix(closeServer.URL, "http")
+	closeWsm := wsmanager.NewWSManager(closeURL, context.Background(), slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})))
+	closeWsm.SetPinger(nil)
+	if err := closeWsm.Connect(); err != nil {
+		t.Fatalf("Connect (close path): %v", err)
+	}
+
+	if err := closeWsm.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	select {
+	case event = <-closeWsm.DisconnectSig:
+	case <-time.After(3 * time.Second):
+		t.Fatal("DisconnectSig did not fire after intentional Close")
+	}
+	if event.Reason == "" {
+		t.Error("expected non-empty Reason on DisconnectEvent after intentional Close")
+	}
+	if event.Err != nil {
+		t.Errorf("expected nil Err on DisconnectEvent after intentional Close, got %v", event.Err)
+	}
+	closeWsm.Wait()
 }
