@@ -52,7 +52,15 @@ type WSManager struct {
 	// its buffer is full. Queued frames remain readable after Close. An in-flight
 	// frame blocked on send is dropped when the connection context is canceled;
 	// callers need not drain DataCh for Wait to return.
-	DataCh        chan ReceivedFrame
+	DataCh chan ReceivedFrame
+
+	// DisconnectSig receives one event for every successful transition to
+	// Disconnected, including failed Connect attempts and intentional Close.
+	// Reconnect by consuming one event and making exactly one Connect call (apply
+	// backoff before the call); a failed attempt queues the next event. Do not run
+	// an inner retry loop without consuming this channel, because its queued
+	// "connect failed" event can become stale after a later successful connection.
+	// On shutdown, cancel the parent context or stop the loop before calling Close.
 	DisconnectSig chan DisconnectEvent
 	disconnectWg  sync.WaitGroup
 
@@ -71,7 +79,7 @@ type WSManager struct {
 	httpClient *http.Client
 	transport  *http.Transport
 
-	Pinger Pinger
+	pinger Pinger
 }
 
 // Wait blocks until the current connection's reader and pinger have stopped.

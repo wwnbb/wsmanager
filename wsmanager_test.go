@@ -298,7 +298,7 @@ func TestConnectToMockServer(t *testing.T) {
 		t.Errorf("Expected StateConnected, got %v", wsm.GetConnState())
 	}
 
-	msg := map[string]interface{}{"test": "message"}
+	msg := map[string]any{"test": "message"}
 	err = wsm.SendRequest(msg)
 	if err != nil {
 		t.Errorf("Failed to send request: %v", err)
