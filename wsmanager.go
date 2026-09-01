@@ -147,13 +147,13 @@ func (m *WSManager) closeConnIfCurrent(conn *WSConnection, closeCode websocket.S
 func (m *WSManager) SetPinger(pinger Pinger) {
 	m.cfgMu.Lock()
 	defer m.cfgMu.Unlock()
-	m.Pinger = pinger
+	m.pinger = pinger
 }
 
 func (m *WSManager) getPinger() Pinger {
 	m.cfgMu.RLock()
 	defer m.cfgMu.RUnlock()
-	return m.Pinger
+	return m.pinger
 }
 
 // SetReadLimit sets the maximum complete inbound WebSocket message size in bytes.
@@ -335,7 +335,7 @@ func NewWSManager(url string, parentCtx context.Context, logger *slog.Logger, da
 		readLimit:     DefaultReadLimit,
 		DataCh:        make(chan ReceivedFrame, chSz),
 		DisconnectSig: make(chan DisconnectEvent, 1),
-		Pinger:        NewDefaultPinger(),
+		pinger:        NewDefaultPinger(),
 	}
 	wsm.logger.Store(logger)
 	return wsm
