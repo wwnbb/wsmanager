@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	neturl "net/url"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -14,7 +15,6 @@ import (
 
 	"github.com/coder/websocket"
 
-	pp "github.com/wwnbb/pprint"
 	"github.com/wwnbb/wsmanager/bpool"
 	"github.com/wwnbb/wsmanager/states"
 )
@@ -88,7 +88,7 @@ func (m *WSManager) Wait() {
 	// Serialize with an in-flight Connect so its disconnectWg.Add is registered
 	// before the counter is observed. Acquire/release only: refreshContext
 	// waits on disconnectWg directly and must not hold connectMu (deadlock).
-	m.connectMu.Lock()
+	m.connectMu.Lock() // XXX: !Important
 	m.connectMu.Unlock()
 	m.disconnectWg.Wait()
 }
@@ -307,10 +307,10 @@ func (m *WSManager) notifyDisconnect(reason string, err error) {
 }
 
 // NewWSManager creates a manager. nil logger becomes slog.Default().
-// dataChSize is optional; default buffer is 1000.
+// dataChSize is optional; default buffer is 10,000.
 func NewWSManager(url string, parentCtx context.Context, logger *slog.Logger, dataChSize ...int) *WSManager {
 	ctx, cancel := context.WithCancel(parentCtx)
-	chSz := 1000
+	chSz := 10_000
 	if len(dataChSize) > 0 && dataChSize[0] > 0 {
 		chSz = dataChSize[0]
 	}
@@ -392,6 +392,52 @@ func (m *WSManager) refreshContext() error {
 	default:
 	}
 	return nil
+}
+
+// SetURL replaces the connection URL while the manager is not connected.
+// It is legal only from StateNew or StateDisconnected — the same states from
+// which Connect is allowed — and returns an error in any other state without
+// changing anything. The URL is validated up front (parse, ws/wss scheme,
+// non-empty host) so a bad URL fails here instead of inside Connect's dial.
+//
+// SetURL changes nothing but the URL: the connection state, manager context,
+// DataCh, DisconnectSig, and requestIds are untouched and no disconnect event
+// is emitted. It remains valid after Close; the next Connect refreshes the
+// manager context itself.
+//
+// Lock ordering: connectMu only — the same mutex Connect and Close hold — so
+// SetURL cannot interleave with an in-flight Connect, and the write is
+// visible to Connect's reads of m.url under the same lock.
+func (m *WSManager) SetURL(url string) error {
+	m.connectMu.Lock()
+	defer m.connectMu.Unlock()
+
+	current := m.GetConnState()
+	if current != states.StateNew && current != states.StateDisconnected {
+		return fmt.Errorf("SetURL requires state New or Disconnected, current: %s", current)
+	}
+
+	u, err := neturl.Parse(url)
+	if err != nil {
+		return fmt.Errorf("invalid websocket URL: %w", err)
+	}
+	if u.Scheme != "ws" && u.Scheme != "wss" {
+		return fmt.Errorf("invalid websocket URL scheme %q: must be ws or wss", u.Scheme)
+	}
+	if u.Host == "" {
+		return fmt.Errorf("invalid websocket URL %q: missing host", url)
+	}
+
+	m.url = url
+	return nil
+}
+
+// URL returns the current connection URL. It takes connectMu, so it blocks
+// while a concurrent Connect/Close/SetURL runs; intended for logging and tests.
+func (m *WSManager) URL() string {
+	m.connectMu.Lock()
+	defer m.connectMu.Unlock()
+	return m.url
 }
 
 func (m *WSManager) Connect() error {
@@ -571,6 +617,9 @@ func (m *WSManager) readMessages(conn *WSConnection) {
 	logger.Debug("Starting ReadMessages")
 	defer logger.Debug("Exiting ReadMessages")
 
+	dataChFullLogged := false
+	dataChFullLogAt := time.Time{}
+
 loop:
 	for {
 		select {
@@ -623,12 +672,26 @@ loop:
 				return
 			}
 
+			dataChLen := len(m.DataCh)
+			dataChCap := cap(m.DataCh)
+			if dataChLen == dataChCap {
+				// Log at most once per 10s while saturated to avoid flooding
+				// when the buffer oscillates between full and nearly full.
+				now := time.Now()
+				if !dataChFullLogged || now.Sub(dataChFullLogAt) >= 10*time.Second {
+					logger.Warn("DataCh buffer full; applying websocket read backpressure",
+						"queued", dataChLen, "capacity", dataChCap)
+					dataChFullLogAt = now
+				}
+				dataChFullLogged = true
+			} else {
+				dataChFullLogged = false
+			}
+
 			// Cancellation wins over a blocked DataCh send: drop this in-flight frame.
 			select {
 			case m.DataCh <- frame:
-				if logger.Enabled(context.Background(), slog.LevelDebug) {
-					logger.Debug("received message", "type", frame.Type, "data", pp.PrettyFormat(frame.Data))
-				}
+				logger.Debug("received message", "type", frame.Type, "data", string(frame.Data))
 			case <-conn.ctx.Done():
 				logger.Debug("dropping in-flight frame on connection cancel")
 				return
@@ -686,8 +749,6 @@ func (m *WSManager) SendRequest(v any) error {
 	}
 
 	logger := m.Logger()
-	if logger.Enabled(context.Background(), slog.LevelDebug) {
-		logger.Debug("sent message", "data", pp.PrettyFormat(v))
-	}
+	logger.Debug("sent message")
 	return nil
 }

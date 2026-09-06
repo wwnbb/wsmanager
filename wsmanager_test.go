@@ -192,8 +192,8 @@ func TestDataChannelCapacity(t *testing.T) {
 	ctx := context.Background()
 	wsm := wsmanager.NewWSManager("wss://example.com/ws", ctx, nil)
 
-	if cap(wsm.DataCh) != 1000 {
-		t.Errorf("Expected DataCh capacity of 1000, got %d", cap(wsm.DataCh))
+	if cap(wsm.DataCh) != 10_000 {
+		t.Errorf("Expected DataCh capacity of 10,000, got %d", cap(wsm.DataCh))
 	}
 }
 
