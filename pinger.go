@@ -40,7 +40,8 @@ type Pinger interface {
 //   - Before each retry attempt (and once before final timeout failure), any
 //     pending pong is accepted so a pong that arrives after a wait timeout keeps
 //     the cycle alive even if a retry ping races with it.
-//   - A documented pong (success:true, ret_msg:"pong", op:"ping") ends the cycle
+//   - A documented pong (success:true, ret_msg:"pong", op:"ping" on Spot/Linear/
+//     Inverse; op:"pong" on Option/Spread, private and trade) ends the cycle
 //     successfully. Echoed req_id is not required (Spot may omit it).
 //   - Active JSON ping write error (not intentional cancel) => onError once and
 //     Start returns.
@@ -168,7 +169,11 @@ func waitPong(ctx context.Context, done <-chan struct{}, pongCh <-chan struct{},
 }
 
 // isBybitPong reports whether data is a documented Bybit application pong.
-// Required fields: success=true, ret_msg="pong", op="ping". req_id is optional.
+// Bybit uses two shapes depending on the channel:
+//   - Spot/Linear/Inverse public: success=true, ret_msg="pong", op="ping".
+//     req_id is optional.
+//   - Option/Spread public, private and trade: op="pong", e.g.
+//     {"args":["1672916271846"],"op":"pong"}.
 func isBybitPong(data []byte) bool {
 	// Cheap prefilter: high-volume market frames skip full JSON decode.
 	trimmed := bytes.TrimSpace(data)
@@ -178,10 +183,7 @@ func isBybitPong(data []byte) bool {
 	if !bytes.Contains(data, []byte(`"pong"`)) {
 		return false
 	}
-	if !bytes.Contains(data, []byte(`"ping"`)) {
-		return false
-	}
-	if !bytes.Contains(data, []byte(`success`)) {
+	if !bytes.Contains(data, []byte(`"op"`)) {
 		return false
 	}
 
@@ -193,7 +195,14 @@ func isBybitPong(data []byte) bool {
 	if err := json.Unmarshal(data, &msg); err != nil {
 		return false
 	}
-	return msg.Success && msg.RetMsg == "pong" && msg.Op == "ping"
+	switch msg.Op {
+	case "pong":
+		return true
+	case "ping":
+		return msg.Success && msg.RetMsg == "pong"
+	default:
+		return false
+	}
 }
 
 // intentionalCancel reports whether a Ping error is due to manager ctx cancel or Stop.

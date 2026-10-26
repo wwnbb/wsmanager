@@ -45,6 +45,19 @@ func TestDefaultWsPingInterval(t *testing.T) {
 	}
 }
 
+// bybitPongFrames are real replies from Bybit mainnet to {"req_id":"ping_1","op":"ping"}.
+// Spot/Linear/Inverse echo op "ping"; Option, Private and Trade reply with op "pong".
+var bybitPongFrames = []struct {
+	name string
+	data string
+}{
+	{"spot", `{"success":true,"ret_msg":"pong","conn_id":"d9avt8shteepr00gfc1g-k1lxq","req_id":"ping_1","op":"ping"}`},
+	{"linear", `{"success":true,"ret_msg":"pong","conn_id":"db293t615sdn23peeulg-6izbx","req_id":"ping_1","op":"ping"}`},
+	{"option", `{"args":["1793038339999"],"op":"pong"}`},
+	{"private", `{"req_id":"ping_1","op":"pong","args":["1793038345559"],"conn_id":"datlqae70ucvftnnnhog-y1mn6"}`},
+	{"trade", `{"retCode":0,"retMsg":"OK","op":"pong","data":["1793038351497"],"connId":"dbc2hc60k63mn3vpnoh0-14nf3"}`},
+}
+
 func TestIsBybitPong(t *testing.T) {
 	cases := []struct {
 		name string
@@ -55,13 +68,23 @@ func TestIsBybitPong(t *testing.T) {
 		{"valid_with_req_id", `{"success":true,"ret_msg":"pong","op":"ping","req_id":"ping_1"}`, true},
 		{"valid_leading_spaces", `  {"success":true,"ret_msg":"pong","op":"ping"}`, true},
 		{"valid_leading_tab_newline", "\t\n{\"success\":true,\"ret_msg\":\"pong\",\"op\":\"ping\"}", true},
+		{"op_pong_minimal", `{"op":"pong"}`, true},
 		{"success_false", `{"success":false,"ret_msg":"pong","op":"ping"}`, false},
 		{"wrong_ret_msg", `{"success":true,"ret_msg":"ok","op":"ping"}`, false},
-		{"wrong_op", `{"success":true,"ret_msg":"pong","op":"pong"}`, false},
+		{"wrong_op", `{"success":true,"ret_msg":"pong","op":"subscribe"}`, false},
+		{"pong_outside_op", `{"topic":"tickers.X","data":{"s":"pong"}}`, false},
+		{"ping_request", `{"req_id":"ping_1","op":"ping"}`, false},
 		{"not_json", `not-json`, false},
 		{"trade", `{"topic":"publicTrade.BTCUSDT","data":[]}`, false},
 		{"empty", ``, false},
 		{"array", `[]`, false},
+	}
+	for _, pf := range bybitPongFrames {
+		cases = append(cases, struct {
+			name string
+			data string
+			want bool
+		}{"real_" + pf.name, pf.data, true})
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -107,67 +130,73 @@ func dialTestConn(t *testing.T, handler func(*websocket.Conn)) (*WSConnection, *
 }
 
 func TestDefaultPingerConsumesValidPong(t *testing.T) {
-	pingSeen := make(chan struct{}, 8)
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		conn, err := websocket.Accept(w, r, nil)
-		if err != nil {
-			return
-		}
-		defer conn.Close(websocket.StatusNormalClosure, "")
-		ctx := context.Background()
-		for {
-			_, data, err := conn.Read(ctx)
-			if err != nil {
-				return
-			}
-			if strings.Contains(string(data), `"op":"ping"`) {
-				select {
-				case pingSeen <- struct{}{}:
-				default:
+	for _, pf := range bybitPongFrames {
+		t.Run(pf.name, func(t *testing.T) {
+			pingSeen := make(chan struct{}, 8)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				conn, err := websocket.Accept(w, r, nil)
+				if err != nil {
+					return
 				}
-				pong := []byte(`{"success":true,"ret_msg":"pong","op":"ping"}`)
-				if err := conn.Write(ctx, websocket.MessageText, pong); err != nil {
+				defer conn.Close(websocket.StatusNormalClosure, "")
+				ctx := context.Background()
+				for {
+					_, data, err := conn.Read(ctx)
+					if err != nil {
+						return
+					}
+					if strings.Contains(string(data), `"op":"ping"`) {
+						select {
+						case pingSeen <- struct{}{}:
+						default:
+						}
+						if err := conn.Write(ctx, websocket.MessageText, []byte(pf.data)); err != nil {
+							return
+						}
+					}
+				}
+			}))
+			defer server.Close()
+
+			url := "ws" + strings.TrimPrefix(server.URL, "http")
+			m := NewWSManager(url, context.Background(), testErrLogger())
+			// An unrecognized pong exhausts a cycle within 30ms + 2*100ms.
+			p := newTestDefaultPinger(30*time.Millisecond, 1, 100*time.Millisecond)
+			m.SetPinger(p)
+
+			if err := m.Connect(); err != nil {
+				t.Fatalf("Connect: %v", err)
+			}
+			defer func() {
+				_ = m.Close()
+				m.Wait()
+			}()
+
+			for i := 0; i < 2; i++ {
+				select {
+				case <-pingSeen:
+				case <-time.After(3 * time.Second):
+					t.Fatalf("timed out waiting for ping %d", i)
+				}
+			}
+
+			deadline := time.After(500 * time.Millisecond)
+			for {
+				select {
+				case frame := <-m.DataCh:
+					if string(frame.Data) == pf.data {
+						t.Fatalf("pong was delivered to DataCh: %s", frame.Data)
+					}
+				case ev := <-m.DisconnectSig:
+					t.Fatalf("disconnected despite pongs: reason=%q err=%v", ev.Reason, ev.Err)
+				case <-deadline:
+					if m.GetConnState() != states.StateConnected {
+						t.Fatalf("state = %v, want Connected after successful pongs", m.GetConnState())
+					}
 					return
 				}
 			}
-		}
-	}))
-	defer server.Close()
-
-	url := "ws" + strings.TrimPrefix(server.URL, "http")
-	m := NewWSManager(url, context.Background(), testErrLogger())
-	p := newTestDefaultPinger(30*time.Millisecond, 2, 200*time.Millisecond)
-	m.SetPinger(p)
-
-	if err := m.Connect(); err != nil {
-		t.Fatalf("Connect: %v", err)
-	}
-	defer func() {
-		_ = m.Close()
-		m.Wait()
-	}()
-
-	for i := 0; i < 2; i++ {
-		select {
-		case <-pingSeen:
-		case <-time.After(3 * time.Second):
-			t.Fatalf("timed out waiting for ping %d", i)
-		}
-	}
-
-	deadline := time.After(100 * time.Millisecond)
-	for {
-		select {
-		case frame := <-m.DataCh:
-			if isBybitPong(frame.Data) {
-				t.Fatalf("pong was delivered to DataCh: %s", frame.Data)
-			}
-		case <-deadline:
-			if m.GetConnState() != states.StateConnected {
-				t.Fatalf("state = %v, want Connected after successful pongs", m.GetConnState())
-			}
-			return
-		}
+		})
 	}
 }
 
