@@ -20,8 +20,8 @@ import (
 )
 
 // DefaultReadLimit is the default maximum size in bytes of a complete inbound
-// WebSocket message (4 MiB).
-const DefaultReadLimit int64 = 4 << 20
+// WebSocket message (16 MiB).
+const DefaultReadLimit int64 = 16 << 20
 
 // ErrConnectionReplaced is returned by SendRequest when its connection snapshot
 // was superseded by a newer generation before/while the write completed. The

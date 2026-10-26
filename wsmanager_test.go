@@ -15,7 +15,6 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
-	pp "github.com/wwnbb/pprint"
 	"github.com/wwnbb/wsmanager"
 	"github.com/wwnbb/wsmanager/states"
 )
@@ -807,7 +806,7 @@ func TestCreateWsManager(t *testing.T) {
 				fmt.Println("websocket: Exiting listener goroutine")
 				return
 			case msg := <-wsm.DataCh:
-				fmt.Printf("websocket: Recieved msg \n----------\n%s\n----------\n", pp.PrettyFormat(msg))
+				fmt.Printf("websocket: Recieved msg \n----------\n%+v\n----------\n", msg)
 			}
 		}
 	}()

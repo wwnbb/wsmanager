@@ -21,7 +21,7 @@ func testErrLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
 }
 
-func newTestDefaultPinger(interval, retryInterval time.Duration, retries int) *DefaultPinger {
+func newTestDefaultPinger(interval time.Duration, retries int, retryInterval time.Duration) *DefaultPinger {
 	return &DefaultPinger{
 		interval:      interval,
 		retries:       retries,
@@ -136,7 +136,7 @@ func TestDefaultPingerConsumesValidPong(t *testing.T) {
 
 	url := "ws" + strings.TrimPrefix(server.URL, "http")
 	m := NewWSManager(url, context.Background(), testErrLogger())
-	p := newTestDefaultPinger(30*time.Millisecond, 200*time.Millisecond, 2)
+	p := newTestDefaultPinger(30*time.Millisecond, 2, 200*time.Millisecond)
 	m.SetPinger(p)
 
 	if err := m.Connect(); err != nil {
@@ -189,7 +189,7 @@ func TestDefaultPingerPongTimeoutDisconnects(t *testing.T) {
 
 	url := "ws" + strings.TrimPrefix(server.URL, "http")
 	m := NewWSManager(url, context.Background(), testErrLogger())
-	p := newTestDefaultPinger(20*time.Millisecond, 40*time.Millisecond, 1)
+	p := newTestDefaultPinger(20*time.Millisecond, 1, 40*time.Millisecond)
 	m.SetPinger(p)
 
 	if err := m.Connect(); err != nil {
@@ -237,7 +237,7 @@ func TestDefaultPingerReusableAcrossReconnects(t *testing.T) {
 
 	url := "ws" + strings.TrimPrefix(server.URL, "http")
 	m := NewWSManager(url, context.Background(), testErrLogger())
-	p := newTestDefaultPinger(25*time.Millisecond, 150*time.Millisecond, 2)
+	p := newTestDefaultPinger(25*time.Millisecond, 2, 150*time.Millisecond)
 	m.SetPinger(p)
 
 	if err := m.Connect(); err != nil {
