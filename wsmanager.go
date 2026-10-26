@@ -691,7 +691,9 @@ loop:
 			// Cancellation wins over a blocked DataCh send: drop this in-flight frame.
 			select {
 			case m.DataCh <- frame:
-				logger.Debug("received message", "type", frame.Type, "data", string(frame.Data))
+				if logger.Enabled(context.Background(), slog.LevelDebug) {
+					logger.Debug("received message", "type", frame.Type, "data", string(frame.Data))
+				}
 			case <-conn.ctx.Done():
 				logger.Debug("dropping in-flight frame on connection cancel")
 				return
