@@ -1022,8 +1022,8 @@ func TestCanceledParentAfterCloseDoesNotLeaveConnecting(t *testing.T) {
 }
 
 func TestDefaultReadLimitConstant(t *testing.T) {
-	if wsmanager.DefaultReadLimit != 4<<20 {
-		t.Fatalf("DefaultReadLimit = %d, want %d", wsmanager.DefaultReadLimit, 4<<20)
+	if wsmanager.DefaultReadLimit != 16<<20 {
+		t.Fatalf("DefaultReadLimit = %d, want %d", wsmanager.DefaultReadLimit, 16<<20)
 	}
 }
 

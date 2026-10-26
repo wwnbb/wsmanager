@@ -275,7 +275,7 @@ func TestDefaultPingerReusableAcrossReconnects(t *testing.T) {
 }
 
 func TestDefaultPingerStopDoesNotClosePongCh(t *testing.T) {
-	p := newTestDefaultPinger(time.Hour, time.Hour, 0)
+	p := newTestDefaultPinger(time.Hour, 0, time.Hour)
 	p.mu.Lock()
 	p.done = make(chan struct{})
 	p.pongCh = make(chan struct{}, 1)
@@ -310,7 +310,7 @@ func TestHeartbeatCancelBeforePingNoOnError(t *testing.T) {
 		_, _, _ = c.Read(context.Background())
 	})
 
-	p := newTestDefaultPinger(time.Hour, 100*time.Millisecond, 2)
+	p := newTestDefaultPinger(time.Hour, 2, 100*time.Millisecond)
 	pongCh := make(chan struct{}, 1)
 	done := make(chan struct{})
 	ctx, cancel := context.WithCancel(context.Background())
@@ -341,7 +341,7 @@ func TestHeartbeatStopDuringWaitNoOnError(t *testing.T) {
 		_, _, _ = c.Read(ctx)
 	})
 
-	p := newTestDefaultPinger(time.Hour, time.Second, 3)
+	p := newTestDefaultPinger(time.Hour, 3, time.Second)
 	pongCh := make(chan struct{}, 1)
 	done := make(chan struct{})
 	ctx := context.Background()
@@ -387,7 +387,7 @@ func TestHeartbeatActiveWriteErrorOnErrorOnce(t *testing.T) {
 	// Force subsequent writes to fail without canceling manager ctx.
 	conn.conn.CloseNow()
 
-	p := newTestDefaultPinger(time.Hour, 200*time.Millisecond, 3)
+	p := newTestDefaultPinger(time.Hour, 3, 200*time.Millisecond)
 	pongCh := make(chan struct{}, 1)
 	done := make(chan struct{})
 	var onErr atomic.Int32
@@ -433,7 +433,7 @@ func TestHeartbeatPendingPongAcceptedBetweenRetries(t *testing.T) {
 	}
 	defer wsConn.CloseNow()
 
-	p := newTestDefaultPinger(time.Hour, 40*time.Millisecond, 2)
+	p := newTestDefaultPinger(time.Hour, 2, 40*time.Millisecond)
 	// Install pongCh as Start would.
 	p.mu.Lock()
 	p.pongCh = make(chan struct{}, 1)
