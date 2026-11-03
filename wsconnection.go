@@ -55,6 +55,14 @@ func (c *WSConnection) WriteJSON(v any) error {
 	return wsjson.Write(ctx, c.conn, v)
 }
 
+// WriteText writes data verbatim as one text frame, for protocols whose
+// heartbeat is not JSON, such as the bare "ping" string of OKX.
+func (c *WSConnection) WriteText(ctx context.Context, data []byte) error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	return c.conn.Write(ctx, websocket.MessageText, data)
+}
+
 // writeJSONWithCtx is the pinger entry point: it serializes payload under
 // writeMu but uses the caller-supplied ctx as the per-attempt deadline budget
 // instead of WriteJSON's fixed time.Minute. Not exported: pinger-only.

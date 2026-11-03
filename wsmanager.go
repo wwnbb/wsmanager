@@ -78,6 +78,8 @@ type WSManager struct {
 	// transport stays directly accessible for CloseIdleConnections in Close.
 	httpClient *http.Client
 	transport  *http.Transport
+	// header is sent with every dial request; guarded by connectMu.
+	header http.Header
 
 	pinger Pinger
 }
@@ -440,6 +442,14 @@ func (m *WSManager) URL() string {
 	return m.url
 }
 
+// SetHeader sets the HTTP headers sent with every later dial request, such
+// as Gate's X-Gate-Size-Decimal. A nil header sends none.
+func (m *WSManager) SetHeader(header http.Header) {
+	m.connectMu.Lock()
+	defer m.connectMu.Unlock()
+	m.header = header.Clone()
+}
+
 func (m *WSManager) Connect() error {
 	m.connectMu.Lock()
 	defer m.connectMu.Unlock()
@@ -478,7 +488,7 @@ func (m *WSManager) Connect() error {
 	dialCtx, dialCancel := context.WithTimeout(mgrCtx, 15*time.Second)
 	defer dialCancel()
 
-	opts := &websocket.DialOptions{HTTPClient: m.httpClient}
+	opts := &websocket.DialOptions{HTTPClient: m.httpClient, HTTPHeader: m.header}
 
 	wsConn, _, err := websocket.Dial(dialCtx, m.url, opts)
 	if err != nil {
